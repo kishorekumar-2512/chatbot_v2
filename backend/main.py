@@ -16,7 +16,7 @@ from typing import Optional
 
 import psycopg2, psycopg2.extras, psycopg2.pool
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
