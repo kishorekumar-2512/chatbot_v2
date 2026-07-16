@@ -1151,11 +1151,18 @@ def circuit_status():
 @limiter.limit("10/minute")
 async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
     start = time.perf_counter()
+    
+    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field
+    is_admin_bypass = ADMIN_API_KEY and req.org_id == ADMIN_API_KEY
+    if is_admin_bypass:
+        req.all_orgs = True
+        req.org_id = None
+
     if req.all_orgs:
-        # Fail closed: an all_orgs request with a missing/wrong key is
-        # rejected outright, never silently downgraded to "just your org"
-        # or, worse, "no filter at all."
-        _check_admin_key(x_admin_key)
+        # If it's a standard all_orgs request without the bypass, verify the header
+        if not is_admin_bypass:
+            _check_admin_key(x_admin_key)
+            
     try:
         result = await generate_sql_with_retry(req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs)
     except ValueError as e:
@@ -1195,10 +1202,16 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
     model's live reasoning/SQL tokens as they're generated, then a final
     event with the same payload shape as ChatResponse.
     """
+    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field
+    is_admin_bypass = ADMIN_API_KEY and req.org_id == ADMIN_API_KEY
+    if is_admin_bypass:
+        req.all_orgs = True
+        req.org_id = None
+
     if req.all_orgs:
-        # Checked here, BEFORE the stream starts, so a bad key gets a clean
-        # 401 response instead of an error buried inside an SSE stream.
-        _check_admin_key(x_admin_key)
+        # If it's a standard all_orgs request without the bypass, verify the header
+        if not is_admin_bypass:
+            _check_admin_key(x_admin_key)
 
     async def event_gen():
         try:
