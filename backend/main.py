@@ -84,19 +84,23 @@ def refresh_validator_cache():
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT table_name FROM information_schema.tables
-                WHERE table_schema='public' AND table_type='BASE TABLE'
+                SELECT c.table_name, c.column_name 
+                FROM information_schema.columns c
+                JOIN information_schema.tables t ON c.table_name = t.table_name
+                WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+                ORDER BY c.table_name, c.ordinal_position
             """)
-            tables = [r["table_name"] for r in cur.fetchall()]
             col_map = {}
-            for t in tables:
-                cur.execute("""
-                    SELECT column_name FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name=%s
-                    ORDER BY ordinal_position
-                """, (t,))
-                col_map[t] = [c["column_name"] for c in cur.fetchall()]
-        _known_tables = set(tables)
+            tables = set()
+            for row in cur.fetchall():
+                t = row["table_name"]
+                c = row["column_name"]
+                tables.add(t)
+                if t not in col_map:
+                    col_map[t] = []
+                col_map[t].append(c)
+                
+        _known_tables = tables
         _known_columns = col_map
         _cache_at = now
     finally:
