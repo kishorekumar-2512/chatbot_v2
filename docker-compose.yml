@@ -1,0 +1,53 @@
+version: "3.9"
+
+# Local orchestration for testing the containerized stack before deploying
+# to ECS. Does NOT include Postgres or Ollama — point DATABASE_URL at your
+# existing dev database (local or RDS) via .env, and OLLAMA_BASE_URL at a
+# host-machine Ollama instance if you're testing the qwen fallback tier
+# (host.docker.internal:11434 on Mac/Windows; use the host's LAN IP on Linux).
+#
+# Usage:
+#   docker compose up --build
+#   Backend:  http://localhost:8000
+#   Frontend: http://localhost:8080
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist the embedding index across container restarts, same role
+      # the EFS mount plays in the ECS deployment.
+      - chroma_data:/app/embeddings/chroma_store
+      - key_store_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    environment:
+      # docker-compose's internal DNS resolves "backend" to the backend
+      # container automatically — no hardcoded IP needed.
+      BACKEND_UPSTREAM: "http://backend:8000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  key_store_data:

@@ -1,0 +1,36 @@
+# ── Secrets & Environment (NEVER commit these) ──────────────────────────────
+.env
+.env.save
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Embeddings (rebuilt per-machine from their own DB) ───────────────────────
+embeddings/chroma_store/
+
+# ── User data & logs ────────────────────────────────────────────────────────
+data/llm_keys.json
+feedback_log.jsonl
+reports/*.pdf
+
+# ── Node / React frontend ──────────────────────────────────────────────────
+web/node_modules/
+web/dist/
+
+# ── IDE & OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+.DS_Store

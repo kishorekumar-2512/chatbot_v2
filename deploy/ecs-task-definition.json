@@ -1,0 +1,86 @@
+{
+  "family": "chatbot-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "3072",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/chatbot-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/chatbot-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/chatbot-backend:latest",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 8000, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "PRIMARY_LLM", "value": "groq" },
+        { "name": "GROQ_MODEL", "value": "openai/gpt-oss-120b" },
+        { "name": "GEMINI_MODEL", "value": "gemini-3.1-flash-lite" },
+        { "name": "RETRIEVAL_TOP_K", "value": "8" },
+        { "name": "REINDEX_INTERVAL_HOURS", "value": "24" },
+        { "name": "CHROMA_DB_PATH", "value": "/app/embeddings/chroma_store" },
+        { "name": "KEY_STORE_PATH", "value": "/app/data/llm_keys.json" },
+        { "name": "DB_SSL_MODE", "value": "require" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:chatbot/database-url" },
+        { "name": "GROQ_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:chatbot/groq-api-key" },
+        { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:chatbot/gemini-api-key" },
+        { "name": "ADMIN_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:chatbot/admin-api-key" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "chroma-index",
+          "containerPath": "/app/embeddings/chroma_store",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "key-store",
+          "containerPath": "/app/data",
+          "readOnly": false
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/chatbot-backend",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "backend"
+        }
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "chroma-index",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-XXXXXXXX",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-XXXXXXXX",
+          "iam": "ENABLED"
+        }
+      }
+    },
+    {
+      "name": "key-store",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "fs-XXXXXXXX",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "fsap-YYYYYYYY",
+          "iam": "ENABLED"
+        }
+      }
+    }
+  ]
+}

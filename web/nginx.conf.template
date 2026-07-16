@@ -1,0 +1,32 @@
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA routing — any unmatched path falls back to index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Reverse-proxy API + SSE calls to the backend. BACKEND_UPSTREAM is
+    # substituted at container start (see Dockerfile) — set it to the
+    # backend's internal ECS Service Connect DNS name, ALB DNS name, or
+    # docker-compose service name. Nothing in the frontend image needs to
+    # change if that address changes between environments.
+    location /api/ {
+        proxy_pass ${BACKEND_UPSTREAM}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # SSE (/chat/stream) needs buffering off and a long read timeout —
+        # otherwise nginx buffers the whole response and the live "thinking"
+        # stream arrives all at once instead of token-by-token.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding off;
+    }
+}
