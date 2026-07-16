@@ -24,3 +24,18 @@ output "ecs_service_name" {
 output "efs_file_system_id" {
   value = aws_efs_file_system.storage.id
 }
+
+output "frontend_cloudfront_domain" {
+  description = "CloudFront domain name for the React frontend"
+  value       = aws_cloudfront_distribution.frontend.domain_name
+}
+
+output "frontend_cloudfront_distribution_id" {
+  description = "CloudFront distribution ID (needed for cache invalidation in CI/CD)"
+  value       = aws_cloudfront_distribution.frontend.id
+}
+
+output "frontend_s3_bucket" {
+  description = "S3 bucket name for frontend assets"
+  value       = aws_s3_bucket.frontend.id
+}

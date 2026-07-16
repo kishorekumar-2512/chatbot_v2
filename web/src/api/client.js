@@ -3,13 +3,32 @@
  *
  * In development, Vite proxies /api/* to http://localhost:8000/*.
  * In production, set VITE_API_URL to the backend URL.
+ *
+ * Authentication: If a JWT token is stored in sessionStorage under
+ * 'auth_token', it is automatically attached as a Bearer header.
+ * When REQUIRE_AUTH is disabled on the backend, the header is simply ignored.
  */
 const BASE = import.meta.env.VITE_API_URL || '/api';
+
+/**
+ * Get the stored auth token (if any).
+ */
+function getAuthHeaders() {
+  const token = sessionStorage.getItem('auth_token');
+  if (token) {
+    return { Authorization: `Bearer ${token}` };
+  }
+  return {};
+}
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+      ...options.headers,
+    },
     ...options,
   });
 
@@ -54,7 +73,10 @@ export async function postStream(path, body) {
   const url = `${BASE}${path}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
     body: JSON.stringify(body),
   });
 
@@ -73,7 +95,10 @@ export async function postDownload(path, body) {
   const url = `${BASE}${path}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAuthHeaders(),
+    },
     body: JSON.stringify(body),
   });
 
@@ -84,3 +109,4 @@ export async function postDownload(path, body) {
 
   return res.blob();
 }
+

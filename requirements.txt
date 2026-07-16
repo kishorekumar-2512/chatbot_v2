@@ -23,3 +23,7 @@ slowapi==0.1.9
 
 # MCP server architecture
 mcp==1.2.0
+
+# JWT authentication (production SSO)
+PyJWT>=2.8.0
+cryptography>=42.0.0

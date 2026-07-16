@@ -59,6 +59,7 @@ from backend.self_correction import (
 )
 from backend.insights import compute_quick_stats, generate_followups
 from backend.chart_builder import build_chart
+from backend.auth import get_current_user, AuthenticatedUser
 
 load_dotenv()
 
@@ -150,9 +151,13 @@ app = FastAPI(title="AI Database Report Chatbot — Max Accuracy", lifespan=life
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 FRONTEND_ORIGIN_REACT = os.getenv("FRONTEND_ORIGIN_REACT", "http://localhost:5173")
+CLOUDFRONT_ORIGIN = os.getenv("CLOUDFRONT_ORIGIN", "")  # e.g. https://d1234abcd.cloudfront.net
+_cors_origins = [FRONTEND_ORIGIN, FRONTEND_ORIGIN_REACT]
+if CLOUDFRONT_ORIGIN:
+    _cors_origins.append(CLOUDFRONT_ORIGIN)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, FRONTEND_ORIGIN_REACT],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
@@ -1086,17 +1091,17 @@ class ReportRequest(BaseModel):
 # ── LLM Key Management Routes ─────────────────────────────────────────────────
 
 @app.get("/settings/providers")
-def list_providers():
+def list_providers(user: AuthenticatedUser = Depends(get_current_user)):
     """List all supported LLM providers and their available models."""
     return {"providers": SUPPORTED_PROVIDERS}
 
 @app.get("/settings/keys")
-def list_keys(customer_id: str = "default"):
+def list_keys(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
     """List all configured API keys for a customer (keys are masked)."""
     return {"keys": get_all_keys(customer_id)}
 
 @app.post("/settings/keys")
-async def add_key(req: LLMKeyRequest):
+async def add_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """Validate and save an API key for a provider."""
     validation = await validate_key(req.provider, req.api_key, req.model)
     if not validation["valid"]:
@@ -1105,17 +1110,17 @@ async def add_key(req: LLMKeyRequest):
     return result
 
 @app.delete("/settings/keys/{provider}")
-def remove_key(provider: str, customer_id: str = "default"):
+def remove_key(provider: str, customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
     """Remove a saved API key."""
     return delete_key(provider, customer_id)
 
 @app.patch("/settings/keys/toggle")
-def toggle_provider(req: LLMKeyToggle):
+def toggle_provider(req: LLMKeyToggle, user: AuthenticatedUser = Depends(get_current_user)):
     """Enable or disable a provider without deleting the key."""
     return toggle_key(req.provider, req.enabled, req.customer_id)
 
 @app.post("/settings/keys/validate")
-async def check_key(req: LLMKeyRequest):
+async def check_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """Test an API key without saving it."""
     return await validate_key(req.provider, req.api_key, req.model)
 
@@ -1130,7 +1135,7 @@ def health():
 
 
 @app.get("/schema")
-def schema():
+def schema(user: AuthenticatedUser = Depends(get_current_user)):
     refresh_validator_cache()
     tables = sorted(list(_known_tables))
     lines  = [f"Table {t} ({', '.join(_known_columns.get(t, []))})" for t in tables]
@@ -1144,7 +1149,7 @@ def circuit_status():
 
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("10/minute")
-async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None)):
+async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
     start = time.perf_counter()
     if req.all_orgs:
         # Fail closed: an all_orgs request with a missing/wrong key is
@@ -1184,7 +1189,7 @@ async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = 
 
 @app.post("/chat/stream")
 @limiter.limit("10/minute")
-async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None)):
+async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
     """
     Server-Sent Events version of /chat. Streams progress updates and the
     model's live reasoning/SQL tokens as they're generated, then a final
@@ -1211,7 +1216,7 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
 
 @app.post("/report/pdf")
 @limiter.limit("10/minute")
-async def generate_pdf(request: Request, req: ReportRequest):
+async def generate_pdf(request: Request, req: ReportRequest, user: AuthenticatedUser = Depends(get_current_user)):
     try:
         pdf_path = await mcp_host.generate_pdf(req.question, req.sql, req.rows)
     except Exception as e:
@@ -1231,7 +1236,7 @@ FEEDBACK_LOG_PATH = os.getenv("FEEDBACK_LOG_PATH", "./feedback_log.jsonl")
 
 @app.post("/feedback")
 @limiter.limit("30/minute")
-async def submit_feedback(request: Request, req: FeedbackRequest):
+async def submit_feedback(request: Request, req: FeedbackRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """
     Append-only feedback log (JSONL). Cheap to add, gives real signal on
     where accuracy is actually failing instead of guessing from complaints.
@@ -1261,7 +1266,7 @@ class RunSqlRequest(BaseModel):
 
 @app.post("/run-sql")
 @limiter.limit("15/minute")
-async def run_sql(request: Request, req: RunSqlRequest):
+async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """
     Lets the user edit the generated SQL in the UI and re-run it directly.
     Goes through the SAME validate_sql() security guards as the normal
@@ -1295,7 +1300,7 @@ async def run_sql(request: Request, req: RunSqlRequest):
 
 
 @app.get("/schema/tables")
-def schema_tables():
+def schema_tables(user: AuthenticatedUser = Depends(get_current_user)):
     """Returns structured table list with columns for the schema explorer."""
     refresh_validator_cache()
     try:

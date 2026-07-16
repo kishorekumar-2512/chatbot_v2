@@ -71,3 +71,9 @@ variable "backend_image" {
   type        = string
   default     = ""
 }
+
+variable "frontend_domain_aliases" {
+  description = "Custom domain names for the CloudFront distribution (e.g. ['chat.example.com']). Leave empty to use the default CloudFront URL."
+  type        = list(string)
+  default     = []
+}
