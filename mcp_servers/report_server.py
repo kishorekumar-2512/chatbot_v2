@@ -78,7 +78,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         path = os.path.join(REPORTS_DIR, "report.pdf")
         pdf = FPDF()
         pdf.set_margins(15, 15, 15)
-        pdf.add_page()
+        
+        # Determine orientation based on column count
+        is_landscape = rows and len(rows[0]) > 4
+        pdf.add_page(orientation="L" if is_landscape else "P")
         pdf.set_auto_page_break(auto=True, margin=15)
         usable_w = pdf.w - pdf.l_margin - pdf.r_margin
 
@@ -104,20 +107,37 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pdf.cell(0, 8, "Data:", new_x="LMARGIN", new_y="NEXT")
             df = pd.DataFrame(rows)
             headers = list(df.columns)
-            col_w = min(38, usable_w / len(headers))
-            pdf.set_font("Helvetica", "B", 8)
+            
+            # Dynamic font size based on column count
+            font_size = 9 if len(headers) <= 6 else (7 if len(headers) <= 10 else 5)
+            
+            # Calculate proportional widths based on content
+            col_max_lens = {}
+            for h in headers:
+                # Find max length of header vs data strings (limit to first 200 rows to be safe)
+                max_data_len = df[h].head(200).astype(str).str.len().max() if not df.empty else 0
+                col_max_lens[h] = max(len(str(h)), min(max_data_len, 40)) # Cap extreme lengths
+                
+            total_len = sum(col_max_lens.values())
+            col_widths = {h: max(10, (col_max_lens[h] / max(total_len, 1)) * usable_w) for h in headers}
+
+            pdf.set_font("Helvetica", "B", font_size)
             pdf.set_fill_color(50, 50, 50)
             pdf.set_text_color(255, 255, 255)
             for h in headers:
-                pdf.cell(col_w, 7, str(h)[:20], border=1, fill=True)
+                # Estimate how many characters fit in the column width (avg 1.5-2 width per char depending on font)
+                max_chars = max(3, int(col_widths[h] / (font_size * 0.25)))
+                pdf.cell(col_widths[h], 7, str(h)[:max_chars], border=1, fill=True)
             pdf.ln()
-            pdf.set_font("Helvetica", "", 8)
+            
+            pdf.set_font("Helvetica", "", font_size)
             pdf.set_text_color(0, 0, 0)
             for i, (_, row) in enumerate(df.iterrows()):
                 if i >= 200:
                     break
                 for h in headers:
-                    pdf.cell(col_w, 6, str(row[h])[:20], border=1)
+                    max_chars = max(3, int(col_widths[h] / (font_size * 0.25)))
+                    pdf.cell(col_widths[h], 6, str(row[h])[:max_chars], border=1)
                 pdf.ln()
 
         pdf.output(path)

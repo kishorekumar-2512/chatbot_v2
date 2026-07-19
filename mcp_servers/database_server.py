@@ -105,8 +105,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             with _get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql)
-                    rows = [dict(r) for r in cur.fetchall()]
-            return [TextContent(type="text", text=json.dumps({"rows": rows, "row_count": len(rows)}, default=str))]
+                    # Hard limit to 1000 rows to prevent OOM/crashing on massive production tables
+                    rows = [dict(r) for r in cur.fetchmany(1000)]
+                    has_more = cur.fetchone() is not None
+                    
+            response_data = {"rows": rows, "row_count": len(rows), "has_more": has_more}
+            return [TextContent(type="text", text=json.dumps(response_data, default=str))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
