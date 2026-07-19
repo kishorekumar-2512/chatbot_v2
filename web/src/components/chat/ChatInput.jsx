@@ -60,7 +60,10 @@ export default function ChatInput({ onSend }) {
         <button
           type="button"
           className="chat-input-attach"
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => {
+            if (fileInputRef.current) fileInputRef.current.value = '';
+            fileInputRef.current?.click();
+          }}
           disabled={isStreaming}
           title="Upload image (Multimodal RAG)"
         >

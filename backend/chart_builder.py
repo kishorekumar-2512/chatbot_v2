@@ -73,11 +73,29 @@ def build_chart(rows: list[dict], title: str, question: str = "") -> tuple[str |
 
     try:
         import plotly.express as px
+        
+        q_lower = question.lower()
+        explicit_pie = "pie" in q_lower or "donut" in q_lower
+        explicit_bar = "bar chart" in q_lower or "bar graph" in q_lower
+        explicit_line = "line chart" in q_lower or "line graph" in q_lower
+
+        # If they explicitly ask for a line chart, but we didn't find a strict date column, 
+        # we can just use the first non-numeric column as the X-axis for the line chart.
+        if explicit_line and not date_col and len(non_numeric_cols) > 0:
+            label_col = non_numeric_cols[0]
+            metric = numeric_cols[0]
+            fig = px.line(df, x=label_col, y=metric, markers=True, title=title)
+            return fig.to_json(), "line", None
 
         # Time series: date + 1 numeric -> line / area
         if date_col and len(cols) == 2:
             metric = numeric_cols[0]
             d = df.sort_values(date_col)
+            # Override with bar if explicitly requested
+            if explicit_bar:
+                fig = px.bar(d, x=date_col, y=metric, title=title)
+                return fig.to_json(), "bar", None
+                
             fig = px.area(d, x=date_col, y=metric, title=title) if is_cumulative \
                 else px.line(d, x=date_col, y=metric, markers=True, title=title)
             return fig.to_json(), ("area" if is_cumulative else "line"), None
@@ -96,10 +114,11 @@ def build_chart(rows: list[dict], title: str, question: str = "") -> tuple[str |
             label_col, metric = non_numeric_cols[0], numeric_cols[0]
             nunique = df[label_col].nunique()
             looks_like_whole = (2 <= nunique <= 6 and len(df) == nunique)
-            explicit_pie = "pie" in question.lower() or "donut" in question.lower()
-            if looks_like_whole or explicit_pie:
+            
+            if explicit_pie or (looks_like_whole and not explicit_bar and not explicit_line):
                 fig = px.pie(df, names=label_col, values=metric, title=title, hole=0.45)
                 return fig.to_json(), "donut", None
+                
             fig = px.bar(df, x=label_col, y=metric, title=title)
             fig.update_xaxes(tickangle=-30)
             return fig.to_json(), "bar", None

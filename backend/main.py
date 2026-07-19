@@ -202,32 +202,107 @@ Before writing SQL, think step by step inside <think> tags. Keep each step to
 ONE short line — this is a quick planning scratchpad, not an essay:
 <think>
 TABLES: (which tables, from the schema provided)
-JOINS: (join path — note bigint IDs and junction tables like managed_device_managed_users)
-FILTER: (WHERE conditions; note any boolean true/false without quotes)
-TYPE: (COUNT / LIST / AGGREGATE / TOP_N / TREND)
+JOINS: (join path — note bigint IDs and junction tables)
+FILTER: (WHERE conditions; note boolean vs integer vs text columns)
+TYPE: (COUNT / LIST / AGGREGATE / TOP_N / TREND / COMPARISON)
 </think>
 
 Then write the SQL in ```sql ... ``` block.
 After the closing ```, write ONE clear business-language sentence (no SQL terms).
 
-Hard rules — violation means the SQL is WRONG:
+════════════════════════════════════════
+HARD RULES — violation means the SQL is WRONG:
+════════════════════════════════════════
+
 1. ONLY SELECT statements. Never INSERT/UPDATE/DELETE/DROP.
 2. Always alias tables in JOINs (e.g. managed_device md).
 3. For ALL text/string searches use ILIKE '%value%'. NEVER use = 'value' for text.
-4. For boolean columns (agent_status, is_active, is_encrypted, is_enabled, is_administrator,
-   is_disabled, is_locked_out, status (boolean in device_certificate), tpmowned, auto_renew,
-   approved, is_mandatory, reboot_required, is_default)
-   use = true or = false WITHOUT quotes.
-5. Use NULLIF to avoid division by zero.
-6. Use DISTINCT when joining 1-to-many to avoid row duplication (this schema has MANY
-   junction tables like managed_device_managed_users, license_details_managed_device).
-7. All primary keys are bigint named 'id' EXCEPT: license_details_managed_device,
-   license_details_managed_users (composite keys), invoices (invoice_id), subscriptions
-   (subscription_id), plans (plan_id), editions (edition_id), payments (payment_id).
-8. platform and status columns are often INTEGER codes, not text — check schema data_type
-   before using ILIKE on them; only use ILIKE on character varying / text columns.
+4. NEVER SELECT * — always name the specific columns needed.
+5. Use DISTINCT when joining 1-to-many to avoid row duplication.
+6. Use COUNT(DISTINCT pk) instead of COUNT(*) when joining multiple tables.
+7. Always add ORDER BY for readability.
+8. If using SELECT DISTINCT, every column in ORDER BY MUST also appear in
+   the SELECT list — Postgres will reject it otherwise.
+9. Non-aggregated SELECT columns MUST appear in GROUP BY.
+10. Use NULLIF(denominator, 0) to avoid division by zero.
 
-Few-shot examples (real schema):
+════════════════════════════════════════
+INTEGER-CODED COLUMNS (NEVER use ILIKE on these):
+════════════════════════════════════════
+
+managed_device.platform (INTEGER):
+  1 = Windows,  2 = macOS,  3 = Linux
+  ✅ md.platform = 1   (for Windows)
+  ❌ md.platform ILIKE '%windows%'   ← WILL FAIL
+
+managed_device.status (INTEGER):
+  1 = active,  2 = inactive
+  ✅ md.status = 1   (for active)
+  ❌ md.status ILIKE '%active%'   ← WILL FAIL
+
+Always check the schema data_type before using ILIKE — only use it on
+character varying / text columns.
+
+════════════════════════════════════════
+BOOLEAN COLUMNS (use = true / = false WITHOUT quotes):
+════════════════════════════════════════
+
+For: agent_status, is_active, is_encrypted, is_enabled, is_administrator,
+is_disabled, is_locked_out, tpmowned, auto_renew, approved, is_mandatory,
+reboot_required, is_default, restrict_uninstall, tracking_enabled,
+is_self_signed_certificate, status (when boolean)
+
+  ✅ ai.agent_status = true
+  ❌ ai.agent_status = 'true'
+
+════════════════════════════════════════
+SUPERLATIVE PATTERNS (latest, oldest, most, not latest):
+════════════════════════════════════════
+
+"latest" / "newest"  → MAX(col) or ORDER BY col DESC LIMIT 1
+"oldest" / "earliest" → MIN(col) or ORDER BY col ASC LIMIT 1
+"not latest" / "outdated" → WHERE col != (SELECT MAX(col) FROM same_table)
+"most" / "highest"   → ORDER BY metric DESC LIMIT N
+"least" / "lowest"   → ORDER BY metric ASC LIMIT N
+"without X" / "missing X" → LEFT JOIN ... WHERE right.id IS NULL
+                          or WHERE id NOT IN (SELECT ... FROM ...)
+
+════════════════════════════════════════
+DATE / TIME PATTERNS:
+════════════════════════════════════════
+
+"today"       → WHERE col::date = CURRENT_DATE
+"yesterday"   → WHERE col::date = CURRENT_DATE - 1
+"this week"   → WHERE col >= date_trunc('week', CURRENT_DATE)
+"last N days" → WHERE col >= CURRENT_DATE - INTERVAL 'N days'
+"this month"  → WHERE col >= date_trunc('month', CURRENT_DATE)
+"last N months" → WHERE col >= CURRENT_DATE - INTERVAL 'N months'
+Monthly trend → DATE_TRUNC('month', col)::date AS month
+
+════════════════════════════════════════
+CORE JOIN PATHS:
+════════════════════════════════════════
+
+managed_device → device_info           ON device_info.managed_device_id = managed_device.id
+managed_device → agent_info            ON agent_info.managed_device_id = managed_device.id
+managed_device → managed_user          ON managed_device.customer_id = managed_user.customer_id
+managed_device → device_operating_system_info ON device_operating_system_info.managed_device_id = managed_device.id
+managed_device → device_network_map    ON device_network_map.managed_device_id = managed_device.id
+managed_device → device_antivirus      ON device_antivirus.managed_device_id = managed_device.id
+managed_device → device_bitlocker      ON device_bitlocker.managed_device_id = managed_device.id
+managed_device → device_certificate    ON device_certificate.managed_device_id = managed_device.id
+managed_device → alerts                ON alerts.managed_device_id = managed_device.id
+managed_device → device_missing_patch  ON device_missing_patch.managed_device_id = managed_device.id
+managed_device → device_installed_patch ON device_installed_patch.managed_device_id = managed_device.id
+device_missing_patch/installed_patch → org_patch ON org_patch.patch_id = patch.patch_id
+software → software_version           ON software_version.software_id = software.id
+software_version → software_version_managed_device ON svmd.software_version_id = sv.id
+managed_user → user_logon_history      ON user_logon_history.managed_user_id = managed_user.id
+managed_user → managed_user_account_info ON managed_user_account_info.managed_user_id = managed_user.id
+
+════════════════════════════════════════
+FEW-SHOT EXAMPLES (real schema):
+════════════════════════════════════════
 
 Q: which devices have Intel i7 processor
 ```sql
@@ -238,6 +313,22 @@ WHERE di.processor ILIKE '%i7%';
 ```
 Devices whose processor information contains Intel i7.
 
+Q: count windows devices
+```sql
+SELECT COUNT(DISTINCT md.id) AS windows_device_count
+FROM managed_device md
+WHERE md.platform = 1;
+```
+Total Windows devices (platform 1 = Windows).
+
+Q: list mac devices
+```sql
+SELECT DISTINCT md.device_name
+FROM managed_device md
+WHERE md.platform = 2;
+```
+All macOS devices (platform 2 = macOS).
+
 Q: show devices with inactive agents
 ```sql
 SELECT md.device_name, ai.agent_version, ai.upgrade_status
@@ -246,6 +337,15 @@ JOIN agent_info ai ON ai.managed_device_id = md.id
 WHERE ai.agent_status = false;
 ```
 Devices where the monitoring agent is currently inactive.
+
+Q: devices NOT running the latest agent version
+```sql
+SELECT DISTINCT md.device_name, ai.agent_version
+FROM managed_device md
+JOIN agent_info ai ON ai.managed_device_id = md.id
+WHERE ai.agent_version != (SELECT MAX(agent_version) FROM agent_info);
+```
+Devices whose agent is not on the latest available version.
 
 Q: how many customers are there
 ```sql
@@ -284,11 +384,46 @@ WHERE ulh.logon_time::date = CURRENT_DATE
 ORDER BY ulh.logon_time DESC;
 ```
 Users who logged in today, with their most recent logon time.
-7. Always add ORDER BY for readability.
-8. If filtering on platform/status/severity/priority: ALWAYS use ILIKE.
-9. If using SELECT DISTINCT, every column in ORDER BY MUST also appear in
-   the SELECT list — Postgres will reject it otherwise. Either add the
-   ORDER BY column to the SELECT list, or don't use DISTINCT.
+
+Q: alert count by severity
+```sql
+SELECT severity, COUNT(*) AS alert_count
+FROM alerts
+GROUP BY severity
+ORDER BY alert_count DESC;
+```
+Number of alerts grouped by severity level.
+
+Q: devices without antivirus
+```sql
+SELECT DISTINCT md.device_name
+FROM managed_device md
+LEFT JOIN device_antivirus da ON da.managed_device_id = md.id
+WHERE da.id IS NULL;
+```
+Devices that have no antivirus product registered.
+
+Q: OS distribution across all devices
+```sql
+SELECT doi.os_name, COUNT(DISTINCT md.id) AS device_count
+FROM managed_device md
+JOIN device_operating_system_info doi ON doi.managed_device_id = md.id
+GROUP BY doi.os_name
+ORDER BY device_count DESC;
+```
+Count of devices per operating system name.
+
+Q: patch compliance percentage per device
+```sql
+SELECT md.device_name,
+       dps.installed_count,
+       dps.missing_count,
+       ROUND(dps.installed_count * 100.0 / NULLIF(dps.installed_count + dps.missing_count, 0), 1) AS compliance_pct
+FROM managed_device md
+JOIN device_patch_summary dps ON dps.managed_device_id = md.id
+ORDER BY compliance_pct ASC;
+```
+Patch compliance percentage for each device, sorted worst to best.
 """
 
 # Extra guidance only injected for questions that look like they need
