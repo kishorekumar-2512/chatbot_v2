@@ -267,3 +267,114 @@ async def _call_provider(provider: str, api_key: str, model: str, prompt: str, m
             return r.json()["response"].strip()
 
     return None
+
+
+async def analyze_image_with_gemini(image_b64: str, prompt: str, customer_id: str = "default") -> str:
+    """
+    Dedicated Vision Agent function using Gemini (since it has native multimodal support).
+    First tries the user's custom Gemini key. If not set/fails, falls back to the .env GEMINI_API_KEY.
+    """
+    key = get_key("gemini", customer_id)
+    if not key:
+        key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise ValueError("No Gemini API key available for Vision analysis. Please add a Gemini key in Settings or in your .env file.")
+
+    # Strip the data:image/png;base64, prefix if present
+    if "," in image_b64:
+        mime_type = image_b64.split(";")[0].split(":")[1]
+        base64_data = image_b64.split(",")[1]
+    else:
+        mime_type = "image/jpeg"
+        base64_data = image_b64
+
+    # The new recommended default for multimodal
+    model = get_model("gemini", customer_id) or "gemini-3.1-pro" 
+    url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={key}"
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": mime_type, "data": base64_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1}
+    }
+
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+async def analyze_dashboard_with_gemini(image_b64: str, customer_id: str = "default") -> list[dict]:
+    """
+    Multi-chart Vision Agent: identifies every distinct chart/visualization in a
+    dashboard screenshot and returns a list of structured descriptions.
+
+    Returns a list of dicts, each with keys:
+      - chart_number (int)
+      - chart_type (str)  e.g. "pie chart", "bar chart", "line chart"
+      - description (str) natural-language data requirements for that chart
+
+    If only one chart is detected, the list has a single element (so the caller
+    can fall back to the normal single-query path with zero behaviour change).
+    """
+    DASHBOARD_PROMPT = (
+        "Analyze this image carefully. Count how many distinct charts or "
+        "visualizations are present.\n\n"
+        "For EACH chart, output a block in EXACTLY this format:\n"
+        "--- CHART N ---\n"
+        "Type: <chart type, e.g. pie chart, bar chart, line chart, donut chart>\n"
+        "Data: <the metrics, groupings, and filters required as a database query "
+        "requirement in plain English>\n\n"
+        "Number the charts starting from 1. Be brief — list only the data "
+        "requirements, not styling details. If there is only ONE chart, still "
+        "use the same format with CHART 1."
+    )
+
+    raw = await analyze_image_with_gemini(image_b64, DASHBOARD_PROMPT, customer_id)
+    return _parse_dashboard_response(raw)
+
+
+def _parse_dashboard_response(raw: str) -> list[dict]:
+    """Parse the structured Vision Agent output into a list of chart dicts."""
+    import re
+    blocks = re.split(r"---\s*CHART\s+(\d+)\s*---", raw, flags=re.IGNORECASE)
+    # blocks alternates: [preamble, "1", body1, "2", body2, ...]
+    charts: list[dict] = []
+    i = 1
+    while i < len(blocks) - 1:
+        num = int(blocks[i])
+        body = blocks[i + 1].strip()
+
+        chart_type = ""
+        description = ""
+        for line in body.splitlines():
+            line_s = line.strip()
+            if line_s.lower().startswith("type:"):
+                chart_type = line_s[5:].strip()
+            elif line_s.lower().startswith("data:"):
+                description = line_s[5:].strip()
+
+        # If the description spans multiple lines after "Data:", grab them
+        if not description:
+            description = body
+
+        charts.append({
+            "chart_number": num,
+            "chart_type": chart_type,
+            "description": description,
+        })
+        i += 2
+
+    # Fallback: if parsing failed, treat the entire response as a single chart
+    if not charts:
+        charts.append({
+            "chart_number": 1,
+            "chart_type": "",
+            "description": raw,
+        })
+
+    return charts

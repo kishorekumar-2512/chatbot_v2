@@ -52,6 +52,7 @@ except ImportError:
 from backend.llm_key_store import (
     save_key, get_key, get_all_keys, delete_key, toggle_key,
     validate_key, call_customer_llm, SUPPORTED_PROVIDERS,
+    analyze_image_with_gemini, analyze_dashboard_with_gemini,
 )
 from backend.self_correction import (
     build_retry_context, diagnose_zero_rows,
@@ -792,7 +793,7 @@ Question: {question}
 
 
 # ── Streaming pipeline (powers /chat/stream — live progress + model thinking) ─
-async def generate_sql_streaming(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False):
+async def generate_sql_streaming(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False, image_base64: str | None = None):
     """
     Same 6-layer pipeline as generate_sql_with_retry, but implemented as an
     async generator that yields JSON-able event dicts as it goes:
@@ -808,6 +809,47 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     """
     start_total = time.perf_counter()
     refresh_validator_cache()
+
+    if image_base64:
+        yield {"type": "status", "stage": "vision", "message": "👁️ Analyzing uploaded image using Vision Agent..."}
+        try:
+            chart_descriptions = await analyze_dashboard_with_gemini(image_base64)
+            num_charts = len(chart_descriptions)
+
+            if num_charts > 1:
+                # ── Multi-chart dashboard path ──────────────────────────────
+                yield {"type": "status", "stage": "vision",
+                       "message": f"📊 Dashboard detected: {num_charts} charts found. Generating queries for each..."}
+                multi_results = []
+                for cd in chart_descriptions:
+                    chart_q = f"{question}\n\n[Vision Agent — Chart {cd['chart_number']}]:\n" \
+                              f"Chart type requested: {cd['chart_type']}\n" \
+                              f"Data requirements: {cd['description']}"
+                    yield {"type": "status", "stage": "multi_chart",
+                           "message": f"🔄 Processing chart {cd['chart_number']}/{num_charts}: {cd['chart_type']}..."}
+                    try:
+                        single_result = None
+                        async for evt in generate_sql_streaming(chart_q, context, org_id, all_orgs, image_base64=None):
+                            if evt.get("type") == "final":
+                                single_result = evt["data"]
+                            elif evt.get("type") == "error":
+                                single_result = {"error": evt["message"], "chart_info": cd}
+                        if single_result:
+                            single_result["chart_info"] = cd
+                            multi_results.append(single_result)
+                    except Exception as e:
+                        multi_results.append({"error": str(e), "chart_info": cd})
+
+                yield {"type": "multi_final", "data": multi_results}
+                return
+            else:
+                # ── Single chart path (unchanged behavior) ──────────────────
+                cd = chart_descriptions[0]
+                chart_type_hint = f"\nChart type requested: {cd['chart_type']}" if cd['chart_type'] else ""
+                question = f"{question}\n\n[Vision Agent Analysis of uploaded image]:\n{cd['description']}{chart_type_hint}"
+
+        except Exception as e:
+            yield {"type": "status", "stage": "vision_error", "message": f"⚠️ Vision Agent failed: {e}. Falling back to text only."}
 
     # ── L0: Meta/schema bypass — instant, deterministic, no LLM call ────────
     meta_result = try_meta_query(question)
@@ -1060,6 +1102,7 @@ class ChatRequest(BaseModel):
     question: str
     context: Optional[ConversationContext] = None
     org_id: Optional[str] = None
+    image_base64: Optional[str] = None
     # Requires a valid X-Admin-Key header on the request to actually take
     # effect (checked in the route handler, not here) — this is NOT a
     # per-user permission, it's a shared admin secret. See main.py's
@@ -1219,7 +1262,7 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
 
     async def event_gen():
         try:
-            async for event in generate_sql_streaming(req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs):
+            async for event in generate_sql_streaming(req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs, image_base64=req.image_base64):
                 yield f"data: {json.dumps(event, default=str)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"

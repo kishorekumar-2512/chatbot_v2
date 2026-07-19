@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Local orchestration for testing the containerized stack before deploying
 # to ECS. Does NOT include Postgres or Ollama — point DATABASE_URL at your
 # existing dev database (local or RDS) via .env, and OLLAMA_BASE_URL at a
@@ -7,6 +5,7 @@ version: "3.9"
 # (host.docker.internal:11434 on Mac/Windows; use the host's LAN IP on Linux).
 #
 # Usage:
+#   cp .env.example .env   # edit with your values
 #   docker compose up --build
 #   Backend:  http://localhost:8000
 #   Frontend: http://localhost:8080
@@ -20,11 +19,18 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Ensure the frontend container can reach the backend on Docker's
+      # internal network (used by the web container's nginx proxy).
+      FRONTEND_ORIGIN: "http://localhost:8080"
     volumes:
       # Persist the embedding index across container restarts, same role
       # the EFS mount plays in the ECS deployment.
       - chroma_data:/app/embeddings/chroma_store
+      # Persist BYO API keys across restarts.
       - key_store_data:/app/data
+      # Persist feedback logs.
+      - feedback_data:/app/feedback
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -51,3 +57,4 @@ services:
 volumes:
   chroma_data:
   key_store_data:
+  feedback_data:

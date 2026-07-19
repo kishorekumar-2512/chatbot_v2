@@ -19,6 +19,7 @@ import functools
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
 
 CHROMA_DB_PATH  = os.getenv("CHROMA_DB_PATH", "./embeddings/chroma_store")
 EMBED_MODEL     = "all-MiniLM-L6-v2"
@@ -45,6 +46,21 @@ def _get_collection():
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _get_bm25_index():
+    """Load all tables from Chroma and build an in-memory BM25 index."""
+    collection = _get_collection()
+    all_data = collection.get()
+    
+    docs = all_data.get("documents", [])
+    metas = all_data.get("metadatas", [])
+    
+    # Tokenize corpus for BM25
+    tokenized_corpus = [doc.lower().split() for doc in docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+    return bm25, metas
+
+
 def retrieve_relevant_tables(question: str, top_k: int = TOP_K) -> dict:
     """
     Returns:
@@ -57,27 +73,53 @@ def retrieve_relevant_tables(question: str, top_k: int = TOP_K) -> dict:
     model      = _get_model()
     collection = _get_collection()
 
+    # 1. Dense Retrieval (ChromaDB Vector Search)
     query_embedding = model.encode([question]).tolist()
-
-    results = collection.query(
+    dense_results = collection.query(
         query_embeddings=query_embedding,
-        n_results=min(top_k, collection.count()),
+        n_results=collection.count(), # Get all to rank them
     )
+    dense_metas = dense_results["metadatas"][0]
+    
+    dense_ranks = {meta["table_name"]: rank for rank, meta in enumerate(dense_metas)}
 
-    table_names = results["metadatas"][0]
-    distances   = results["distances"][0]  # ChromaDB returns L2 distance by default
+    # 2. Sparse Retrieval (BM25 Keyword Search)
+    bm25, sparse_metas = _get_bm25_index()
+    tokenized_query = question.lower().split()
+    sparse_scores = bm25.get_scores(tokenized_query)
+    
+    # Sort sparse results by score descending
+    sparse_ranked = sorted(zip(sparse_metas, sparse_scores), key=lambda x: x[1], reverse=True)
+    sparse_ranks = {meta["table_name"]: rank for rank, (meta, score) in enumerate(sparse_ranked)}
+
+    # 3. Reciprocal Rank Fusion (RRF)
+    k = 60
+    rrf_scores = {}
+    table_meta_map = {meta["table_name"]: meta for meta in sparse_metas}
+    
+    for table_name in table_meta_map.keys():
+        dense_rank = dense_ranks.get(table_name, len(dense_ranks))
+        sparse_rank = sparse_ranks.get(table_name, len(sparse_ranks))
+        rrf_score = (1.0 / (k + dense_rank)) + (1.0 / (k + sparse_rank))
+        rrf_scores[table_name] = rrf_score
+
+    # Sort by RRF score descending and take top_k
+    top_tables = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
     ddls = []
     tables_used = []
     similarity_scores = {}
 
-    for meta, dist in zip(table_names, distances):
-        table_name = meta["table_name"]
+    # Normalize RRF scores roughly to 0-1 for display
+    max_possible_rrf = (1.0 / k) + (1.0 / k)
+    
+    for table_name, rrf_score in top_tables:
+        meta = table_meta_map[table_name]
         ddls.append(meta["raw_ddl"])
         tables_used.append(table_name)
-        # Convert L2 distance to an approximate 0-1 similarity score for display/confidence scoring
-        similarity = max(0.0, 1.0 - (dist / 2.0))
-        similarity_scores[table_name] = round(similarity, 4)
+        
+        normalized_score = min(1.0, rrf_score / max_possible_rrf)
+        similarity_scores[table_name] = round(normalized_score, 4)
 
     return {
         "schema_text": "\n".join(ddls),

@@ -10,8 +10,8 @@ export async function sendChat(question, context = null, orgId = null) {
 /**
  * Send a chat question with SSE streaming. Returns the raw Response.
  */
-export async function sendChatStream(question, context = null, orgId = null) {
-  return postStream('/chat/stream', { question, context, org_id: orgId });
+export async function sendChatStream(question, context = null, orgId = null, imageBase64 = null) {
+  return postStream('/chat/stream', { question, context, org_id: orgId, image_base64: imageBase64 });
 }
 
 /**

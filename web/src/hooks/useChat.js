@@ -12,8 +12,8 @@ export default function useChat() {
   const store = useChatStore();
   const abortRef = useRef(null);
 
-  const send = useCallback(async (question) => {
-    if (!question.trim() || store.isStreaming) return;
+  const send = useCallback(async (question, imageBase64 = null) => {
+    if (!question.trim() && !imageBase64 || store.isStreaming) return;
 
     const {
       addMessage, updateMessage, setStreaming, setStreamingStatus,
@@ -42,7 +42,7 @@ export default function useChat() {
     }
 
     /* ── Normal chat flow ── */
-    addMessage('user', question);
+    addMessage('user', question, imageBase64 ? { image: imageBase64 } : {});
     const msgId = addMessage('assistant', '', { loading: true });
     setStreaming(true);
     resetThinking();
@@ -51,8 +51,9 @@ export default function useChat() {
     abortRef.current = abortController;
 
     try {
-      const response = await sendChatStream(question, conversationContext, orgId);
+      const response = await sendChatStream(question, conversationContext, orgId, imageBase64);
       let finalData = null;
+      let multiResults = null;
 
       for await (const { event, data } of parseSSEStream(response)) {
         if (abortController.signal.aborted) break;
@@ -65,6 +66,8 @@ export default function useChat() {
               appendThinking(data.text || '');
             } else if (data.type === 'final') {
               finalData = data.data;
+            } else if (data.type === 'multi_final') {
+              multiResults = data.data;
             } else if (data.type === 'error') {
               updateMessage(msgId, {
                 content: `Error: ${data.message || 'Unknown error'}`,
@@ -91,6 +94,29 @@ export default function useChat() {
             question,
             sql: finalData.sql,
             tables_used: finalData.tables_used || [],
+          });
+        }
+      }
+
+      if (multiResults) {
+        const combinedAnswer = multiResults
+          .filter((r) => !r.error)
+          .map((r, i) => `**Chart ${i + 1}** (${r.chart_info?.chart_type || 'chart'}): ${r.answer || ''}`)
+          .join('\n\n');
+        updateMessage(msgId, {
+          content: combinedAnswer || 'Dashboard charts generated.',
+          meta: { multiResults, loading: false },
+        });
+
+        // Use the first successful result for conversation context
+        const first = multiResults.find((r) => r.sql);
+        if (first) {
+          setLastResult(first);
+          addToHistory(question, first.sql);
+          setConversationContext({
+            question,
+            sql: first.sql,
+            tables_used: first.tables_used || [],
           });
         }
       }

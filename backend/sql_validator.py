@@ -81,6 +81,12 @@ def validate_sql(sql: str, known_tables: set, known_columns: dict) -> list[str]:
                 alias_map[alias.lower()] = real_lower
             alias_map[real_lower] = real_lower
             continue
+        if real_lower.startswith("information_schema"):
+            # System schema reference — allow meta-queries without strict validation.
+            if alias:
+                alias_map[alias.lower()] = real_lower
+            alias_map[real_lower] = real_lower
+            continue
         if real_lower not in known_tables:
             # NOTE: previously this dumped all 234 known table names into the
             # error string, which then gets echoed back into the retry prompt
@@ -96,6 +102,8 @@ def validate_sql(sql: str, known_tables: set, known_columns: dict) -> list[str]:
     col_refs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)', sql)
     for tbl_or_alias, col in col_refs:
         tbl = alias_map.get(tbl_or_alias.lower(), tbl_or_alias.lower())
+        if tbl.startswith("information_schema"):
+            continue
         if tbl in known_columns:
             valid_cols = [c.lower() for c in known_columns[tbl]]
             if col.lower() not in valid_cols:

@@ -1,104 +1,183 @@
-# AI Database Report Chatbot — v2 (Upgraded)
+# AI Database Report Chatbot v2
 
-Adds: semantic table retrieval, circuit-breaker model fallback, confidence
-scoring, MCP server architecture, and security hardening on top of the
-original NL-to-SQL chatbot.
+> **Natural-Language → SQL → Charts → Insights** — powered by a 6-layer RAG pipeline, circuit-breaker LLM routing, and multimodal vision.
 
-## What's new vs v1
+Ask questions about your database in plain English. The system generates validated SQL, executes it, and returns results with auto-selected charts, written explanations, confidence scores, and live streaming of the model's reasoning.
 
-| Feature | v1 | v2 |
-|---|---|---|
-| Schema in prompt | Full schema always | Top-8 relevant tables (ChromaDB semantic search) |
-| Model | Qwen only | Qwen → Groq → Gemini circuit breaker |
-| Confidence | None | 4-signal weighted score shown in UI |
-| Architecture | Direct function calls | MCP host + 3 MCP servers |
-| Security | Open CORS | Rate limited (10/min/IP) + restricted CORS |
+---
 
-## 1. Install dependencies
+## ✨ Feature Highlights
+
+| Category | What it does |
+|----------|-------------|
+| **Hybrid RAG** | ChromaDB semantic search + BM25 keyword search with Reciprocal Rank Fusion |
+| **GraphRAG** | NetworkX FK-relationship graph computes correct JOIN paths automatically |
+| **Corrective RAG** | Self-healing SQL: auto-repair, retry, zero-row diagnosis, model escalation |
+| **Multimodal RAG** | Upload chart/dashboard images → Gemini Vision extracts data requirements → SQL |
+| **Multi-Chart Dashboards** | Upload a screenshot with multiple charts → generates separate queries for each |
+| **Circuit Breaker** | Qwen (local) → Groq → Gemini failover chain with automatic recovery |
+| **BYO Keys** | Bring your own API keys for OpenAI, Anthropic, DeepSeek, Groq, Gemini, Ollama |
+| **Live Streaming** | SSE pipeline streams model reasoning tokens and progress to the UI in real time |
+| **Smart Charts** | Auto-selects line, area, bar, grouped bar, donut, or animated counter by data shape |
+| **Confidence Scoring** | 4-signal weighted score: table relevance, column accuracy, attempt score, row sanity |
+| **Multi-Turn Context** | Follow-up questions carry forward table context and previous SQL |
+| **Multi-Tenant Security** | Org-level data isolation via `zecure_org_id` filtering |
+
+---
+
+## 🏗 Architecture Overview
+
+```
+┌──────────────────────────────────────────────────┐
+│                   React SPA (Vite)                │
+│  Zustand state · SSE consumer · Plotly charts     │
+└──────────────────┬───────────────────────────────┘
+                   │ SSE stream
+┌──────────────────▼───────────────────────────────┐
+│              FastAPI Backend                       │
+│                                                    │
+│  L0  Meta bypass (zero-LLM, schema cache)          │
+│  L1  Query intelligence (intent detection)         │
+│  L2  Hybrid retrieval (ChromaDB + BM25 + RRF)      │
+│  L3  Schema graph (NetworkX shortest-path JOINs)   │
+│  L4  SQL generation (chain-of-thought prompt)      │
+│  L5  Validation + self-correction + auto-repair    │
+│  L6  Multimodal RAG (Gemini Vision Agent)          │
+│                                                    │
+│  Circuit Breaker Router: Qwen → Groq → Gemini     │
+└──────────────────┬───────────────────────────────┘
+                   │
+       ┌───────────▼────────────┐
+       │     PostgreSQL DB      │
+       │     (234 tables)       │
+       └────────────────────────┘
+```
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+| Tool | Required | Purpose |
+|------|----------|---------|
+| Python 3.10+ | ✅ | Backend, embeddings, MCP servers |
+| Node.js 18+ | ✅ | React frontend |
+| PostgreSQL | ✅ | The database being queried |
+| Ollama | Optional | Local LLM (Qwen 2.5 Coder 7B) |
+| Docker | Optional | Containerized deployment |
+
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
+cd web && npm install && cd ..
 ```
 
-`sentence-transformers` will download the `all-MiniLM-L6-v2` model (~80MB) on
-first run, then it's fully offline. `mcp` requires Python 3.10+.
-
-## 2. Pull the primary model
-
-```bash
-ollama pull qwen2.5-coder:7b
-```
-
-This is a larger model than the old `qwen2.5:3b` — better SQL accuracy, more
-RAM/VRAM needed. If your machine can't run 7B comfortably, set
-`OLLAMA_MODEL=qwen2.5:3b` in `.env` and the rest of the system still works.
-
-## 3. Get free fallback API keys (optional but recommended)
-
-- **Groq** (fallback 1): https://console.groq.com → API Keys → create key
-- **Gemini** (fallback 2): https://aistudio.google.com → Get API Key
-
-Both are free tier, no credit card. If you skip these, the circuit breaker
-will just fail over to "all models failed" once Qwen's circuit opens — still
-safe, just less resilient.
-
-## 4. Configure environment
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
+# Edit .env — at minimum set DATABASE_URL
 ```
 
-Edit `.env` with your `DATABASE_URL`, and optionally `GROQ_API_KEY` /
-`GEMINI_API_KEY`.
-
-## 5. Build the semantic embedding index
-
-**Run this once**, and again any time your schema changes:
+### 3. Build the embedding index (run once)
 
 ```bash
 python embeddings/build_index.py
 ```
 
-This reads your live Neon schema, embeds each table description locally with
-sentence-transformers, and stores vectors in `./embeddings/chroma_store`.
-
-## 6. Run the app
+### 4. Start the app
 
 ```bash
-# Terminal 1
+# Terminal 1 (optional — only if using local Ollama)
 ollama serve
 
-# Terminal 2
+# Terminal 2 — Backend
 uvicorn backend.main:app --reload --port 8000
 
-# Terminal 3
-streamlit run frontend/app.py
+# Terminal 3 — React Frontend
+cd web && npm run dev
 ```
 
-FastAPI's `lifespan` will automatically launch the 3 MCP servers as
-subprocesses when uvicorn starts, and shut them down cleanly on exit — you
-don't need to run them separately.
+Open **http://localhost:5173** in your browser.
 
-Open http://localhost:8501.
+### Docker alternative
 
-## Notes on the circuit breaker
+```bash
+cp .env.example .env   # edit with your values
+docker compose up --build
+# Backend:  http://localhost:8000
+# Frontend: http://localhost:8080
+```
 
-- Qwen (primary) gets 3 consecutive failures before the circuit "opens" and
-  routing moves to Groq.
-- Groq gets 3 consecutive failures before moving to Gemini.
-- Every 5 minutes, the router attempts one recovery call back to Qwen. If it
-  succeeds, Qwen becomes primary again.
-- Check `/circuit-status` or the sidebar "Refresh Status" button to see live
-  breaker state per tier.
+---
 
-## Notes on confidence scoring
+## 📖 Documentation
 
-Shown as 4 progress bars per answer:
-- **Table relevance** — how well the question matched the tables used (from ChromaDB cosine similarity)
-- **Column accuracy** — 100 if the SQL validator found zero errors on the winning attempt
-- **Attempt score** — penalizes needing 2nd/3rd retries
-- **Row sanity** — flags suspicious 0-row or >10k-row results
+- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** — Detailed step-by-step setup for new contributors
+- **[DOCUMENTATION.md](DOCUMENTATION.md)** — Full technical architecture and engineering report
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** — AWS deployment guide (ECS, S3, CloudFront, Terraform)
 
-Overall ≥80 = high, ≥55 = medium, <55 = low. Low confidence or 3-attempt
-answers show a warning banner in the UI — treat those results with extra
-scrutiny.
+---
+
+## 🔑 Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | ✅ | PostgreSQL connection string |
+| `FRONTEND_ORIGIN` | ✅ | CORS origin (default: `http://localhost:5173`) |
+| `GROQ_API_KEY` | Recommended | Groq cloud fallback (free tier) |
+| `GEMINI_API_KEY` | Recommended | Gemini cloud fallback + Vision Agent (free tier) |
+| `OLLAMA_MODEL` | Optional | Local model name (default: `qwen2.5-coder:7b`) |
+| `PRIMARY_LLM` | Optional | Starting tier: `qwen` (default) or `groq` |
+| `RETRIEVAL_TOP_K` | Optional | Tables retrieved per query (default: 8) |
+
+---
+
+## 🛡 Security
+
+- **Read-only SQL**: Every query is validated — `DROP`, `DELETE`, `UPDATE`, `INSERT` are blocked
+- **Multi-tenant**: `org_id` → `zecure_org_id` filtering enforced at the prompt level
+- **Rate limiting**: 10 requests/minute/IP via SlowAPI
+- **BYO keys**: Customer API keys stored encrypted in `data/llm_keys.json` (gitignored)
+
+---
+
+## 📁 Project Structure
+
+```
+chatbot_v2/
+├── backend/
+│   ├── main.py              # FastAPI app + 6-layer pipeline
+│   ├── model_router.py      # Circuit-breaker LLM chain
+│   ├── llm_key_store.py     # BYO-key storage + Vision Agent
+│   ├── hybrid_retriever.py  # ChromaDB + BM25 retrieval
+│   ├── schema_graph.py      # NetworkX FK graph
+│   ├── query_intelligence.py# Intent detection
+│   ├── sql_validator.py     # Security + schema validation
+│   ├── self_correction.py   # Auto-repair + retry logic
+│   ├── chart_builder.py     # Shape-based chart selection
+│   ├── confidence.py        # 4-signal scoring
+│   └── Dockerfile
+├── embeddings/              # build_index.py, retrieve.py
+├── mcp_servers/             # database, schema, report servers
+├── web/                     # React SPA (Vite + Zustand)
+├── frontend/                # Legacy Streamlit UI
+├── deploy/                  # Terraform + CI/CD
+├── docker-compose.yml
+├── requirements.txt
+└── .env.example
+```
+
+---
+
+## 📊 Confidence Scoring
+
+Every answer shows 4 progress bars:
+- **Table Relevance** — ChromaDB cosine similarity of selected tables
+- **Column Accuracy** — 100% if zero schema validation errors
+- **Attempt Score** — penalizes 2nd/3rd retries
+- **Row Sanity** — flags suspicious 0-row or >10k-row results
+
+Overall ≥80% = High | ≥55% = Medium | <55% = Low

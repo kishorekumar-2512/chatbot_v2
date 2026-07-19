@@ -95,8 +95,9 @@ def build_chart(rows: list[dict], title: str, question: str = "") -> tuple[str |
         if len(cols) == 2 and len(non_numeric_cols) == 1:
             label_col, metric = non_numeric_cols[0], numeric_cols[0]
             nunique = df[label_col].nunique()
-            looks_like_whole = 2 <= nunique <= 6 and len(df) == nunique
-            if looks_like_whole:
+            looks_like_whole = (2 <= nunique <= 6 and len(df) == nunique)
+            explicit_pie = "pie" in question.lower() or "donut" in question.lower()
+            if looks_like_whole or explicit_pie:
                 fig = px.pie(df, names=label_col, values=metric, title=title, hole=0.45)
                 return fig.to_json(), "donut", None
             fig = px.bar(df, x=label_col, y=metric, title=title)

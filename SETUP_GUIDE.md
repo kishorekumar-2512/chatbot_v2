@@ -54,13 +54,18 @@ Then **edit `.env`** and fill in these values:
 | Variable | Required? | What to put |
 |----------|-----------|-------------|
 | `DATABASE_URL` | ✅ **Yes** | Their own PostgreSQL connection string, e.g. `postgresql://postgres:password@localhost:5432/their_db` |
+| `FRONTEND_ORIGIN` | ✅ **Yes** | The frontend URL for CORS, e.g. `http://localhost:5173` |
 | `GROQ_API_KEY` | ⚡ Recommended | Free key from [console.groq.com](https://console.groq.com) (no credit card) |
-| `GEMINI_API_KEY` | ⚡ Recommended | Free key from [aistudio.google.com](https://aistudio.google.com) (no credit card) |
+| `GEMINI_API_KEY` | ⚡ Recommended | Free key from [aistudio.google.com](https://aistudio.google.com) (no credit card). **Required for Multimodal RAG (image uploads).** |
 | `OLLAMA_MODEL` | Only if using Ollama | Default is `qwen2.5-coder:7b` |
 | `PRIMARY_LLM` | Optional | `groq` (default, cloud) or `qwen` (local Ollama) |
+| `RETRIEVAL_TOP_K` | Optional | Number of tables retrieved per query (default: 8) |
 
 > [!IMPORTANT]
 > **They MUST have their own database** — the chatbot generates SQL against a live PostgreSQL database. Without `DATABASE_URL` pointing to a real DB, nothing works.
+
+> [!TIP]
+> **`GEMINI_API_KEY` is needed for the Multimodal RAG feature** (image uploads / dashboard recreation). Without it, text-only queries still work fine, but the 📎 image upload feature will show an error.
 
 > [!TIP]
 > If they skip Groq + Gemini keys, the chatbot still works with just Ollama locally, but the circuit-breaker fallback chain won't have cloud models to fall back to.
@@ -102,21 +107,20 @@ ollama serve
 # Terminal 2 — Backend API
 uvicorn backend.main:app --reload --port 8000
 
-# Terminal 3 — Streamlit Frontend
-streamlit run frontend/app.py
-```
-
-Then open **http://localhost:8501** in the browser.
-
-#### Alternative: React Frontend (instead of Streamlit)
-
-```bash
-# Terminal 3 — React frontend (instead of Streamlit)
+# Terminal 3 — React Frontend (primary UI)
 cd web
 npm run dev
 ```
 
 Then open **http://localhost:5173** in the browser.
+
+#### Alternative: Streamlit Frontend (legacy)
+
+```bash
+# Terminal 3 — Streamlit frontend (legacy, simpler UI)
+streamlit run frontend/app.py
+# Open http://localhost:8501
+```
 
 ---
 
@@ -142,13 +146,38 @@ docker compose up --build
 ✅ Python 3.10+ installed
 ✅ Node.js 18+ installed (for React frontend)
 ✅ PostgreSQL database running with tables
-✅ .env file created with DATABASE_URL filled in
+✅ .env file created with DATABASE_URL and FRONTEND_ORIGIN filled in
 ✅ At least one LLM configured (Groq key OR Ollama installed)
+✅ GEMINI_API_KEY set (for image upload / Multimodal RAG)
 ✅ pip install -r requirements.txt
 ✅ npm install (in web/ folder)
 ✅ python embeddings/build_index.py (run once)
 ✅ Start backend + frontend
 ```
+
+---
+
+## Feature-Specific Notes
+
+### 📎 Multimodal RAG (Image Uploads)
+- Requires a `GEMINI_API_KEY` in `.env` (or a Gemini key added via the Settings UI)
+- Supports uploading screenshots of charts, dashboards, and spreadsheets
+- **Single chart**: Extracts data requirements and generates one SQL query + chart
+- **Multi-chart dashboard**: Detects multiple charts, generates a separate SQL query for each, and renders all results in one message
+
+### 🔄 BYO API Keys
+- Users can add their own LLM API keys in the ⚙️ Settings drawer (top-right of the UI)
+- Supports: OpenAI, Anthropic Claude, DeepSeek, Groq, Google Gemini, Ollama
+- Keys are stored encrypted in `data/llm_keys.json`
+
+### 📊 Smart Auto-Charts
+The chart builder automatically picks the best visualization:
+- **Single number** → Animated counter
+- **Date + metric** → Line chart (or Area if cumulative)
+- **Category + metric (≤6 categories)** → Donut chart
+- **Category + metric (>6 categories)** → Bar chart
+- **Category + subcategory + metric** → Grouped bar chart
+- User can override by saying "pie chart" or "donut" in their question
 
 ---
 
@@ -161,6 +190,8 @@ docker compose up --build
 | "All models failed" | No LLM is available — add a `GROQ_API_KEY` or start `ollama serve` |
 | Port 8000 in use | Another app is using it — kill that process or change the port |
 | `mcp` import error | Need Python 3.10+ (MCP library requires it) |
+| Image upload shows error | Set `GEMINI_API_KEY` in `.env` or add a Gemini key in Settings |
+| Vision Agent timeout | Large images take longer — try cropping to just the chart area |
 
 ---
 
