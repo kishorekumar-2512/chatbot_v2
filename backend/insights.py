@@ -36,8 +36,16 @@ def compute_quick_stats(rows: list[dict]) -> list[str]:
     stats.append(f"Rows: {len(df):,}")
 
     # Numeric columns — surface sum/avg/max for up to 2 of them (skip when
-    # there's only 1 row: total == avg == max, so the line adds no information)
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    # there's only 1 row: total == avg == max, so the line adds no information).
+    # Exclude IDs, foreign keys, and status/boolean columns.
+    numeric_cols = [
+        c for c in df.columns 
+        if pd.api.types.is_numeric_dtype(df[c]) 
+        and not c.lower().endswith("id")
+        and not c.lower() == "id"
+        and not c.lower() == "status"
+        and not pd.api.types.is_bool_dtype(df[c])
+    ]
     if len(df) > 1:
         for col in numeric_cols[:2]:
             series = pd.to_numeric(df[col], errors="coerce").dropna()

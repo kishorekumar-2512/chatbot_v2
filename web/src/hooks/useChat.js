@@ -51,7 +51,7 @@ export default function useChat() {
     abortRef.current = abortController;
 
     try {
-      const response = await sendChatStream(question, conversationContext, orgId, imageBase64);
+      const response = await sendChatStream(question, conversationContext, orgId, imageBase64, abortController.signal);
       let finalData = null;
       let multiResults = null;
 
@@ -62,8 +62,16 @@ export default function useChat() {
           case 'message':
             if (data.type === 'status') {
               setStreamingStatus(data.message || data.status || '');
+              if (data.stage === 'fallback') {
+                useChatStore.getState().notify('warning', 'Model fallback', data.message || 'Switching to a backup model…');
+              } else if (data.stage === 'escalate') {
+                useChatStore.getState().notify('warning', 'Escalating model', data.message || 'Retrying with a stronger model…');
+              }
             } else if (data.type === 'thinking_token') {
               appendThinking(data.text || '');
+            } else if (data.type === 'answer') {
+              const currentContent = useChatStore.getState().messages.find((m) => m.id === msgId)?.content || '';
+              updateMessage(msgId, { content: currentContent + (data.delta || data.text || '') });
             } else if (data.type === 'final') {
               finalData = data.data;
             } else if (data.type === 'multi_final') {
@@ -73,6 +81,7 @@ export default function useChat() {
                 content: `Error: ${data.message || 'Unknown error'}`,
                 meta: { loading: false, error: true },
               });
+              useChatStore.getState().notify('error', 'Query failed', data.message || 'All models failed to answer this query.');
             }
             break;
           default:
@@ -126,11 +135,20 @@ export default function useChat() {
           content: `Connection error: ${err.message}`,
           meta: { loading: false, error: true },
         });
+        useChatStore.getState().notify('error', 'Connection error', err.message || 'Could not reach the backend.');
       }
     } finally {
       setStreaming(false);
       resetThinking();
       abortRef.current = null;
+      
+      const currentMsg = useChatStore.getState().messages.find((m) => m.id === msgId);
+      if (currentMsg && currentMsg.meta?.loading) {
+        updateMessage(msgId, {
+          content: currentMsg.content || 'Generation stopped by user.',
+          meta: { loading: false },
+        });
+      }
     }
   }, []);
 

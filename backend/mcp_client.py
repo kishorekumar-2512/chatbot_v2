@@ -26,6 +26,13 @@ from mcp.client.stdio import stdio_client
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class RowList(list):
+    def __init__(self, iterable, total_count=0, has_more=False):
+        super().__init__(iterable)
+        self.total_count = total_count
+        self.has_more = has_more
+
+
 class MCPHost:
     """
     Manages all 3 MCP server subprocess connections.
@@ -79,7 +86,10 @@ class MCPHost:
         data = json.loads(result.content[0].text)
         if "error" in data:
             raise ValueError(data["error"])
-        return data.get("rows", [])
+        rows = data.get("rows", [])
+        total_count = data.get("total_count", len(rows))
+        has_more = data.get("has_more", False)
+        return RowList(rows, total_count=total_count, has_more=has_more)
 
     async def search_tables(self, question: str, top_k: int = 8) -> dict:
         result = await self.schema_session.call_tool("search_tables", {"question": question, "top_k": top_k})

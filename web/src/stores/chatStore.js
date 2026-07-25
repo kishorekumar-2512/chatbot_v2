@@ -14,6 +14,19 @@ const useChatStore = create((set, get) => ({
     localStorage.setItem('orgId', id);
     set({ orgId: id });
   },
+  /**
+   * Switch back to the org login screen. Also clears messages and query
+   * history: both were being kept under a single global (non-org-scoped)
+   * localStorage key, so without this a person switching orgs would see
+   * the previous org's recent queries and chat history bleed into the new
+   * session — a cross-tenant leak in the UI even though the backend
+   * itself scopes query data correctly per org.
+   */
+  logoutOrg: () => {
+    localStorage.removeItem('orgId');
+    localStorage.removeItem('queryHistory');
+    set({ orgId: '', messages: [], conversationContext: null, queryHistory: [], lastResult: null });
+  },
 
   /* ── Messages ────────────────────────────────────────── */
   messages: [],
@@ -58,6 +71,13 @@ const useChatStore = create((set, get) => ({
   toggleSettings: () => set((s) => ({ settingsOpen: !s.settingsOpen })),
   setSettingsOpen: (v) => set({ settingsOpen: v }),
 
+   rightSidebarOpen: true, // Default to open on desktop
+  toggleRightSidebar: () => set((s) => ({ rightSidebarOpen: !s.rightSidebarOpen })),
+  setRightSidebarOpen: (v) => set({ rightSidebarOpen: v }),
+  
+  rightSidebarTab: 'schema', // 'schema' | 'history' | 'trace'
+  setRightSidebarTab: (tab) => set({ rightSidebarTab: tab }),
+
   /* ── Connection status ───────────────────────────────── */
   connectionStatus: 'checking', // 'online' | 'offline' | 'degraded' | 'checking'
   setConnectionStatus: (s) => set({ connectionStatus: s }),
@@ -80,6 +100,49 @@ const useChatStore = create((set, get) => ({
   /* ── Schema cache ────────────────────────────────────── */
   schemaData: null,
   setSchemaData: (d) => set({ schemaData: d }),
+
+  /* ── Theme ────────────────────────────────────────────── */
+  isDarkMode: (localStorage.getItem('theme') || 'dark') !== 'light',
+  toggleDarkMode: () => set((s) => {
+    const next = !s.isDarkMode;
+    localStorage.setItem('theme', next ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', next ? 'dark' : 'light');
+    return { isDarkMode: next };
+  }),
+
+  /* ── Notifications ────────────────────────────────────── */
+  notifications: [],
+  unreadCount: 0,
+  notificationsOpen: false,
+  toggleNotifications: () => set((s) => {
+    const open = !s.notificationsOpen;
+    return { notificationsOpen: open, unreadCount: open ? 0 : s.unreadCount };
+  }),
+  setNotificationsOpen: (v) => set({ notificationsOpen: v, unreadCount: v ? 0 : get().unreadCount }),
+  addNotification: (type, title, message) => {
+    const notif = { id: uid(), type, title, message, timestamp: Date.now(), read: false };
+    set((s) => ({
+      notifications: [notif, ...s.notifications].slice(0, 30),
+      unreadCount: s.notificationsOpen ? 0 : s.unreadCount + 1,
+    }));
+    return notif.id;
+  },
+  clearNotifications: () => set({ notifications: [], unreadCount: 0 }),
+
+  /* ── Toasts (transient, auto-dismissing) ─────────────────── */
+  toasts: [],
+  pushToast: (type, message) => {
+    const toast = { id: uid(), type, message };
+    set((s) => ({ toasts: [...s.toasts, toast] }));
+    return toast.id;
+  },
+  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+
+  /** Raise both a toast (transient, top-right) and a notification (persists in the bell dropdown). */
+  notify: (type, title, message) => {
+    get().addNotification(type, title, message);
+    get().pushToast(type, message);
+  },
 }));
 
 export default useChatStore;

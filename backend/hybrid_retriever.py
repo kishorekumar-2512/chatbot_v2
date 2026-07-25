@@ -44,7 +44,10 @@ _bm25_data: Optional[dict] = None  # {table_name: tokenized_description}
 def _get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        _model = SentenceTransformer(EMBED_MODEL)
+        import os
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        _model = SentenceTransformer(EMBED_MODEL, local_files_only=True)
     return _model
 
 

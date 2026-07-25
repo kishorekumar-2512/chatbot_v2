@@ -12,6 +12,8 @@ every time.
 """
 
 import os, sys
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -1211,6 +1213,20 @@ RICH_DESCRIPTIONS = {
     ),
 }
 
+RICH_COLUMN_DESCRIPTIONS = {
+    "device_certificate": {
+        "status": "Active status of the certificate (e.g. True/False or active/revoked)",
+        "issued_by": "The certificate authority or entity that issued the certificate (e.g. Let's Encrypt, DigiCert)",
+        "issued_to": "The device or domain to which the certificate belongs",
+        "serial_number": "Unique hardware or software serial identifier of the certificate",
+    },
+    "managed_device": {
+        "device_name": "The hostname or user-friendly name of the managed machine",
+        "zecure_org_id": "Organization tenant identifier to enforce strict data security boundaries",
+        "status": "Active deployment status of the managed device (e.g. active, inactive, pending)",
+    }
+}
+
 
 def fetch_schema_descriptions() -> list[dict]:
     """Kept for backward compatibility with any external callers — now backed
@@ -1219,7 +1235,7 @@ def fetch_schema_descriptions() -> list[dict]:
     any table not covered by RICH_DESCRIPTIONS, instead of a bare column list."""
     if not DATABASE_URL:
         print("ERROR: DATABASE_URL not set in .env"); sys.exit(1)
-    return introspect_all(DATABASE_URL, RICH_DESCRIPTIONS)
+    return introspect_all(DATABASE_URL, RICH_DESCRIPTIONS, RICH_COLUMN_DESCRIPTIONS)
 
 
 def _get_collection(client):
@@ -1303,7 +1319,7 @@ def build_index(incremental: bool = True) -> dict:
     updated = len(to_upsert) - added
     summary = {"added": added, "updated": updated, "removed": len(to_remove),
                "unchanged": unchanged, "total_tables": len(tables), "sources": sources}
-    print(f"\n✅ Index sync complete — {added} added, {updated} updated, {len(to_remove)} removed, {unchanged} unchanged.")
+    print(f"\n[OK] Index sync complete - {added} added, {updated} updated, {len(to_remove)} removed, {unchanged} unchanged.")
     print(f"   Storage: {CHROMA_DB_PATH}")
     return summary
 

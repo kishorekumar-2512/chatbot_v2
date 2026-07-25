@@ -69,7 +69,7 @@ export async function del(path) {
 /**
  * Stream a POST request (for SSE). Returns the raw Response for stream parsing.
  */
-export async function postStream(path, body) {
+export async function postStream(path, body, signal = null) {
   const url = `${BASE}${path}`;
   const res = await fetch(url, {
     method: 'POST',
@@ -78,6 +78,7 @@ export async function postStream(path, body) {
       ...getAuthHeaders(),
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!res.ok) {

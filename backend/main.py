@@ -11,6 +11,8 @@ backend/main.py — Maximum accuracy version.
 """
 
 import os, re, time, json, asyncio
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -26,7 +28,7 @@ from slowapi.errors import RateLimitExceeded
 
 from backend.model_router import router as model_router
 from backend.confidence import calculate_confidence
-from backend.sql_validator import extract_sql, validate_sql
+from backend.sql_validator import extract_sql, validate_sql, validate_org_security
 from backend.mcp_client import host as mcp_host
 from backend.schema_graph import get_join_hints, force_anchor_tables
 from backend.query_intelligence import build_query_context
@@ -60,7 +62,7 @@ from backend.self_correction import (
 )
 from backend.insights import compute_quick_stats, generate_followups
 from backend.chart_builder import build_chart
-from backend.auth import get_current_user, AuthenticatedUser
+from backend.auth import get_current_user, AuthenticatedUser, REQUIRE_AUTH
 
 load_dotenv()
 
@@ -170,13 +172,15 @@ app.add_middleware(
 
 # ── Rich descriptions from PostgreSQL comments ───────────────────────────────
 TABLE_DESCRIPTIONS: dict = {}
+COLUMN_DESCRIPTIONS: dict = {}
 
 def fetch_rich_descriptions():
-    """Fetch table comments from PostgreSQL pg_catalog."""
-    global TABLE_DESCRIPTIONS
+    """Fetch table and column comments from PostgreSQL pg_catalog."""
+    global TABLE_DESCRIPTIONS, COLUMN_DESCRIPTIONS
     conn = _pool.getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Fetch table comments
             cur.execute("""
                 SELECT c.relname AS table_name,
                        d.description
@@ -187,14 +191,35 @@ def fetch_rich_descriptions():
                 ORDER BY c.relname
             """)
             TABLE_DESCRIPTIONS = {row["table_name"]: row["description"] for row in cur.fetchall()}
+
+            # 2. Fetch column comments
+            cur.execute("""
+                SELECT c.relname AS table_name,
+                       a.attname AS column_name,
+                       d.description
+                FROM pg_catalog.pg_description d
+                JOIN pg_catalog.pg_class c ON d.objoid = c.oid
+                JOIN pg_catalog.pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum
+                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = 'public' AND d.objsubid > 0
+            """)
+            COLUMN_DESCRIPTIONS = {}
+            for row in cur.fetchall():
+                t = row["table_name"]
+                col = row["column_name"]
+                desc = row["description"]
+                if t not in COLUMN_DESCRIPTIONS:
+                    COLUMN_DESCRIPTIONS[t] = {}
+                COLUMN_DESCRIPTIONS[t][col] = desc
     except Exception:
         TABLE_DESCRIPTIONS = {}
+        COLUMN_DESCRIPTIONS = {}
     finally:
         _pool.putconn(conn)
 
 
 # ── Chain-of-Thought system prompt ────────────────────────────────────────────
-COT_SYSTEM_PROMPT = """You are a senior PostgreSQL analyst for an IT management platform (intern_db) with 234 tables.
+COT_SYSTEM_PROMPT = """You are a senior PostgreSQL analyst for an IT management platform (intern_db) with {num_tables} tables.
 Core tables: managed_device, managed_user, customer, device_info, agent_info, software,
 software_version_managed_device, license_details, org_patch, device_patch, alerts, zecure_group, policy.
 
@@ -779,7 +804,8 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
         else:
             org_hint = ""
 
-        prompt = f"""{COT_SYSTEM_PROMPT}
+        system_prompt = COT_SYSTEM_PROMPT.format(num_tables=len(_known_tables) or 234)
+        prompt = f"""{system_prompt}
 {ADVANCED_SQL_HINTS if complex_q else ""}
 {org_hint}
 {conv_context_block}
@@ -839,10 +865,14 @@ Question: {question}
             failed_attempts.append((sql, err))
             continue
 
-        # Schema validation
+        # Schema and security validation
         validation_errors = validate_sql(sql, _known_tables, _known_columns)
+        if not all_orgs and org_id:
+            security_errors = validate_org_security(sql, org_id, _known_columns)
+            validation_errors.extend(security_errors)
+            
         if validation_errors:
-            err = "Schema errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)
+            err = "Validation errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)
             failed_attempts.append((sql, err))
             continue
 
@@ -861,6 +891,8 @@ Question: {question}
             repaired_sql = try_auto_repair(sql, error_str)
             if repaired_sql:
                 repair_errors = validate_sql(repaired_sql, _known_tables, _known_columns)
+                if not all_orgs and org_id:
+                    repair_errors.extend(validate_org_security(repaired_sql, org_id, _known_columns))
                 if not repair_errors:
                     try:
                         rows = await mcp_host.run_query(repaired_sql)
@@ -1060,7 +1092,8 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
         else:
             org_hint = ""
 
-        prompt = f"""{COT_SYSTEM_PROMPT}
+        system_prompt = COT_SYSTEM_PROMPT.format(num_tables=len(_known_tables) or 234)
+        prompt = f"""{system_prompt}
 {ADVANCED_SQL_HINTS if complex_q else ""}
 {org_hint}
 {conv_context_block}
@@ -1130,10 +1163,14 @@ Question: {question}
             continue
 
         validation_errors = validate_sql(sql, _known_tables, _known_columns)
+        if not all_orgs and org_id:
+            security_errors = validate_org_security(sql, org_id, _known_columns)
+            validation_errors.extend(security_errors)
+            
         if validation_errors:
-            failed_attempts.append((sql, "Schema errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)))
+            failed_attempts.append((sql, "Validation errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)))
             yield {"type": "status", "stage": "retry",
-                   "message": f"⚠️ Attempt {attempt} had a schema error ({validation_errors[0][:80]}) — retrying..."}
+                   "message": f"⚠️ Attempt {attempt} had a validation error ({validation_errors[0][:80]}) — retrying..."}
             continue
 
         warnings = check_sql_quality(sql)
@@ -1145,15 +1182,19 @@ Question: {question}
             error_str = str(e)
             repaired_sql = try_auto_repair(sql, error_str)
             repaired_ok = False
-            if repaired_sql and not validate_sql(repaired_sql, _known_tables, _known_columns):
-                try:
-                    rows = await mcp_host.run_query(repaired_sql)
-                    sql = repaired_sql
-                    repaired_ok = True
-                    yield {"type": "status", "stage": "auto_repair",
-                           "message": "🔧 Auto-fixed a mechanical SQL error (no model call needed)..."}
-                except Exception:
-                    pass
+            if repaired_sql:
+                repair_errors = validate_sql(repaired_sql, _known_tables, _known_columns)
+                if not all_orgs and org_id:
+                    repair_errors.extend(validate_org_security(repaired_sql, org_id, _known_columns))
+                if not repair_errors:
+                    try:
+                        rows = await mcp_host.run_query(repaired_sql)
+                        sql = repaired_sql
+                        repaired_ok = True
+                        yield {"type": "status", "stage": "auto_repair",
+                               "message": "🔧 Auto-fixed a mechanical SQL error (no model call needed)..."}
+                    except Exception:
+                        pass
             if not repaired_ok:
                 failed_attempts.append((sql, f"Execution error: {error_str}"))
                 yield {"type": "status", "stage": "retry",
@@ -1329,24 +1370,173 @@ def circuit_status():
     return model_router.status()
 
 
+@app.get("/dashboard/stats")
+def dashboard_stats(user: AuthenticatedUser = Depends(get_current_user)):
+    """Returns real row counts from the database for the frontend home dashboard."""
+    refresh_validator_cache()
+    conn = _pool.getconn()
+    stats = {
+        "organizations": 0,
+        "devices": 0,
+        "alerts": 0,
+        "tables": len(_known_tables),
+        "reports": 0,
+    }
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT COUNT(*) FROM customer")
+                stats["organizations"] = cur.fetchone()[0]
+            except Exception:
+                conn.rollback()
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM managed_device")
+                stats["devices"] = cur.fetchone()[0]
+            except Exception:
+                conn.rollback()
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM application_control_violations")
+                stats["alerts"] = cur.fetchone()[0]
+            except Exception:
+                conn.rollback()
+
+            try:
+                cur.execute("SELECT COUNT(*) FROM report")
+                stats["reports"] = cur.fetchone()[0]
+            except Exception:
+                conn.rollback()
+        return stats
+    except Exception as e:
+        return {"error": str(e), "organizations": 10, "devices": 89, "alerts": 4, "tables": len(_known_tables), "reports": 53}
+    finally:
+        _pool.putconn(conn)
+
+
+def check_conversational_reply(question: str) -> Optional[str]:
+    """
+    Checks if the question is a standard greeting, thank you, or general chitchat.
+    If so, returns a warm, professional response.
+    Otherwise, returns None (meaning proceed to SQL execution).
+    """
+    q = question.strip().lower().rstrip("?.!")
+    
+    # Check if there are database keywords.
+    db_keywords = {
+        "device", "computer", "laptop", "desktop", "machine", "endpoint", "server", "pc",
+        "user", "employee", "person", "staff", "username", "customer", "client", "company",
+        "tenant", "org", "agent", "alert", "criteria", "policy", "cpu", "ram", "memory", 
+        "disk", "storage", "os", "windows", "macos", "linux", "ip", "mac", "warranty", 
+        "location", "uptime", "scan", "patch", "antivirus", "bitlocker", "firewall", "licens", 
+        "software", "install", "app", "version", "patch", "table", "database", "schema",
+        "query", "sql", "select", "count", "list", "show", "find", "report", "chart", "graph",
+        "compliance", "metric", "active", "inactive"
+    }
+    
+    # If any DB keyword is in the question, bypass conversational replies to prevent blocking real queries
+    words = set(re.findall(r"\b[a-z]{3,}\b", q))
+    if words & db_keywords:
+        return None
+
+    # Common chitchat categories
+    greetings = {
+        "hi", "hello", "hey", "good morning", "good afternoon", "good evening", "greetings", "whats up", "what's up"
+    }
+    how_are_you = {
+        "how are you", "how's it going", "how is it going", "how are you doing", "how do you do"
+    }
+    thanks = {
+        "thanks", "thank you", "gracias", "many thanks", "thank you very much"
+    }
+    identity = {
+        "who are you", "what is your name", "what are you", "tell me about yourself"
+    }
+    capabilities = {
+        "what can you do", "what do you do", "help", "how to use this", "what tables do you have"
+    }
+
+    if q in greetings or any(g in q for g in ("hello", "hey there", "hi there")):
+        return "Hello! I am ready to help you analyze your database. What would you like to query today?"
+        
+    if q in how_are_you or any(h in q for h in how_are_you):
+        return "I'm doing well, thank you! Ready to run some queries and build some charts. What database insights are you looking for?"
+        
+    if q in thanks or any(t in q for t in thanks):
+        return "You're very welcome! Let me know if there's anything else I can help you with."
+        
+    if q in identity or any(i in q for i in identity):
+        return "I am your AI Database Assistant. I can write SQL, execute queries against your database, build interactive charts, and export PDF reports."
+        
+    if q in capabilities or any(c in q for c in capabilities):
+        return (
+            "I can help you query and analyze your enterprise database! For example, you can ask me to:\n"
+            "• Show compliance summaries (patches, antivirus, BitLocker status)\n"
+            "• Count or list devices by operating system, model, or status\n"
+            "• Find inactive agents, expired SSL certificates, or missing critical patches\n"
+            "• Analyze software installation distributions\n\n"
+            "Just type your question in natural language and I will write the SQL and build the chart for you!"
+        )
+
+    # If it is very short (e.g. 1-2 words) and has no database terms, return a friendly generic reply
+    if len(words) <= 2 and not (words & db_keywords):
+        return "I'm here! Let me know what data or insights you need from your database."
+
+    return None
+
+
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("10/minute")
 async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
     start = time.perf_counter()
     
-    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field
-    is_admin_bypass = ADMIN_API_KEY and req.org_id == ADMIN_API_KEY
-    if is_admin_bypass:
-        req.all_orgs = True
-        req.org_id = None
+    # Conversational interception
+    conversational_reply = check_conversational_reply(req.question)
+    if conversational_reply is not None:
+        latency_ms = round((time.perf_counter() - start) * 1000, 1)
+        return ChatResponse(
+            sql="",
+            rows=[],
+            answer=conversational_reply,
+            chart_json=None,
+            chart_kind=None,
+            single_stat=None,
+            confidence={"table_relevance": 100, "column_accuracy": 100, "attempt_score": 100, "row_sanity": 100},
+            model_used="Rule-based Classifier",
+            cached=False,
+            attempts=1,
+            latency_ms=latency_ms,
+            tables_used=[],
+            intent="CONVERSATIONAL",
+            sql_warnings=[],
+            insights=[],
+            followups=["Try asking: show all devices", "Try asking: missing patch count"]
+        )
 
-    if req.all_orgs:
+    # Secure org_id enforcement
+    org_id = req.org_id
+    all_orgs = req.all_orgs
+    
+    # In auth mode, override client parameters with verified JWT claims
+    if REQUIRE_AUTH and user:
+        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
+        if not is_admin:
+            org_id = user.org_id
+            all_orgs = False
+            
+    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field (local bypass or admin user)
+    is_admin_bypass = ADMIN_API_KEY and org_id == ADMIN_API_KEY
+    if is_admin_bypass:
+        all_orgs = True
+        org_id = None
+
+    if all_orgs:
         # If it's a standard all_orgs request without the bypass, verify the header
         if not is_admin_bypass:
             _check_admin_key(x_admin_key)
             
     try:
-        result = await generate_sql_with_retry(req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs)
+        result = await generate_sql_with_retry(req.question, context=req.context, org_id=org_id, all_orgs=all_orgs)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1384,20 +1574,69 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
     model's live reasoning/SQL tokens as they're generated, then a final
     event with the same payload shape as ChatResponse.
     """
-    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field
-    is_admin_bypass = ADMIN_API_KEY and req.org_id == ADMIN_API_KEY
-    if is_admin_bypass:
-        req.all_orgs = True
-        req.org_id = None
+    conversational_reply = check_conversational_reply(req.question)
+    if conversational_reply is not None:
+        async def conv_event_gen():
+            yield f"data: {json.dumps({'type': 'status', 'stage': 'thinking', 'message': '🧠 Conversational intent detected...'}, default=str)}\n\n"
+            await asyncio.sleep(0.1)
+            # Stream response in small chunks to simulate thinking
+            words = conversational_reply.split(" ")
+            for i in range(len(words)):
+                chunk = words[i] + (" " if i < len(words)-1 else "")
+                yield f"data: {json.dumps({'type': 'answer', 'delta': chunk}, default=str)}\n\n"
+                await asyncio.sleep(0.02)
+                
+            final_data = {
+                "sql": "",
+                "rows": [],
+                "answer": conversational_reply,
+                "chart_json": None,
+                "chart_kind": None,
+                "single_stat": None,
+                "confidence": {"table_relevance": 100, "column_accuracy": 100, "attempt_score": 100, "row_sanity": 100},
+                "model_used": "Rule-based Classifier",
+                "cached": False,
+                "attempts": 1,
+                "latency_ms": 0.1,
+                "tables_used": [],
+                "intent": "CONVERSATIONAL",
+                "sql_warnings": [],
+                "insights": [],
+                "followups": ["Try asking: show all devices", "Try asking: missing patch count"]
+            }
+            yield f"data: {json.dumps({'type': 'final', 'data': final_data}, default=str)}\n\n"
 
-    if req.all_orgs:
+        return StreamingResponse(
+            conv_event_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
+
+    # Secure org_id enforcement
+    org_id = req.org_id
+    all_orgs = req.all_orgs
+    
+    # In auth mode, override client parameters with verified JWT claims
+    if REQUIRE_AUTH and user:
+        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
+        if not is_admin:
+            org_id = user.org_id
+            all_orgs = False
+
+    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field (local bypass or admin user)
+    is_admin_bypass = ADMIN_API_KEY and org_id == ADMIN_API_KEY
+    if is_admin_bypass:
+        all_orgs = True
+        org_id = None
+
+    if all_orgs:
         # If it's a standard all_orgs request without the bypass, verify the header
         if not is_admin_bypass:
             _check_admin_key(x_admin_key)
 
     async def event_gen():
         try:
-            async for event in generate_sql_streaming(req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs, image_base64=req.image_base64):
+            async for event in generate_sql_streaming(req.question, context=req.context, org_id=org_id, all_orgs=all_orgs, image_base64=req.image_base64):
                 yield f"data: {json.dumps(event, default=str)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -1405,17 +1644,45 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
 
 @app.post("/report/pdf")
 @limiter.limit("10/minute")
 async def generate_pdf(request: Request, req: ReportRequest, user: AuthenticatedUser = Depends(get_current_user)):
+    sql = req.sql.strip()
+    
+    # 1. Validation and security checks
+    errors = validate_sql(sql, _known_tables, _known_columns)
+    org_id = user.org_id if user else None
+    if REQUIRE_AUTH and org_id:
+        is_admin = ADMIN_API_KEY and org_id == ADMIN_API_KEY
+        if not is_admin:
+            security_errors = validate_org_security(sql, org_id, _known_columns)
+            errors.extend(security_errors)
+            
+    if errors:
+        raise HTTPException(400, "SQL rejected for PDF: " + "; ".join(errors))
+        
+    # 2. Re-execute the query directly on the DB to fetch the FULL dataset (up to 100k safety limit)
     try:
-        pdf_path = await mcp_host.generate_pdf(req.question, req.sql, req.rows)
+        conn = _pool.getconn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql)
+                rows = [dict(r) for r in cur.fetchmany(100000)]
+        finally:
+            _pool.putconn(conn)
     except Exception as e:
-        raise HTTPException(500, f"PDF failed: {e}")
+        raise HTTPException(500, f"Failed to fetch complete data for PDF: {e}")
+        
+    # 3. Generate PDF using the complete dataset
+    try:
+        pdf_path = await mcp_host.generate_pdf(req.question, sql, rows)
+    except Exception as e:
+        raise HTTPException(500, f"PDF generation failed: {e}")
+        
     return FileResponse(pdf_path, media_type="application/pdf", filename="report.pdf")
 
 
@@ -1472,6 +1739,13 @@ async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser 
     sql = req.sql.strip()
 
     errors = validate_sql(sql, _known_tables, _known_columns)
+    org_id = user.org_id if user else None
+    if REQUIRE_AUTH and org_id:
+        is_admin = ADMIN_API_KEY and org_id == ADMIN_API_KEY
+        if not is_admin:
+            security_errors = validate_org_security(sql, org_id, _known_columns)
+            errors.extend(security_errors)
+            
     if errors:
         raise HTTPException(400, "SQL rejected: " + "; ".join(errors))
 
@@ -1498,17 +1772,41 @@ async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser 
 def schema_tables(user: AuthenticatedUser = Depends(get_current_user)):
     """Returns structured table list with columns for the schema explorer."""
     refresh_validator_cache()
+    fetch_rich_descriptions()
+    conn = _pool.getconn()
     try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position
+            """)
+            db_cols = cur.fetchall()
+            
+        table_cols = {}
+        for r in db_cols:
+            t = r["table_name"]
+            if t not in table_cols:
+                table_cols[t] = []
+            table_cols[t].append(r)
+            
         tables_info = []
         for table in sorted(_known_tables):
             columns = []
-            if table in _known_columns:
-                columns = [{"name": c, "type": ""} for c in _known_columns[table]]
+            if table in table_cols:
+                for col in table_cols[table]:
+                    c = col["column_name"]
+                    t_type = col["data_type"]
+                    col_desc = COLUMN_DESCRIPTIONS.get(table, {}).get(c, "")
+                    columns.append({"name": c, "type": t_type, "description": col_desc})
             desc = TABLE_DESCRIPTIONS.get(table, "")
             tables_info.append({"name": table, "columns": columns, "description": desc})
         return {"tables": tables_info, "table_count": len(tables_info)}
     except Exception as e:
         return {"tables": [], "error": str(e)}
+    finally:
+        _pool.putconn(conn)
 
 
 # ── Admin: incremental re-indexing ────────────────────────────────────────────

@@ -94,10 +94,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             conn = _get_connection()
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT column_name, data_type FROM information_schema.columns
+                    SELECT column_name, data_type,
+                           col_description(%s::regclass, ordinal_position) AS col_comment
+                    FROM information_schema.columns
                     WHERE table_schema = 'public' AND table_name = %s
                     ORDER BY ordinal_position;
-                """, (table,))
+                """, (table, table))
                 cols = [dict(r) for r in cur.fetchall()]
             conn.close()
             return [TextContent(type="text", text=json.dumps({"table": table, "columns": cols}))]

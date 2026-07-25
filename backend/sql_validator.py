@@ -113,3 +113,57 @@ def validate_sql(sql: str, known_tables: set, known_columns: dict) -> list[str]:
                 )
 
     return errors
+
+
+def validate_org_security(sql: str, org_id: str, known_columns: dict) -> list[str]:
+    """
+    Validates that the SQL query restricts all tables containing the 'zecure_org_id' column
+    to the authorized org_id. Returns a list of security errors (empty = pass).
+    """
+    if not org_id:
+        return []
+        
+    errors = []
+    
+    # Identify CTE names to exclude them from real table checks
+    cte_matches = re.findall(
+        r'\bWITH\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(|,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(',
+        sql, re.IGNORECASE
+    )
+    cte_names = {g.lower() for pair in cte_matches for g in pair if g}
+
+    # Find table references and aliases in FROM and JOIN
+    table_refs = re.findall(
+        r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?',
+        sql, re.IGNORECASE
+    )
+    
+    # Check each table reference
+    for real, alias in table_refs:
+        real_lower = real.lower()
+        if real_lower in cte_names or real_lower.startswith("information_schema"):
+            continue
+            
+        # Does this table have the zecure_org_id column?
+        cols = [c.lower() for c in known_columns.get(real_lower, [])]
+        if "zecure_org_id" in cols:
+            alias_or_table = alias.lower() if alias else real_lower
+            
+            # Match: alias.zecure_org_id = '{org_id}' or alias.zecure_org_id = {org_id} (ignoring spaces & quotes)
+            pattern_eq = rf"\b{re.escape(alias_or_table)}\s*\.\s*zecure_org_id\s*=\s*['\"]?{re.escape(str(org_id))}['\"]?\b"
+            pattern_in = rf"\b{re.escape(alias_or_table)}\s*\.\s*zecure_org_id\s+in\s*\(\s*['\"]?{re.escape(str(org_id))}['\"]?\s*\)"
+            
+            # Check direct column reference without alias just in case
+            pattern_no_alias_eq = rf"\bzecure_org_id\s*=\s*['\"]?{re.escape(str(org_id))}['\"]?\b"
+            pattern_no_alias_in = rf"\bzecure_org_id\s+in\s*\(\s*['\"]?{re.escape(str(org_id))}['\"]?\s*\)"
+            
+            if not (re.search(pattern_eq, sql, re.IGNORECASE) or 
+                    re.search(pattern_in, sql, re.IGNORECASE) or
+                    re.search(pattern_no_alias_eq, sql, re.IGNORECASE) or
+                    re.search(pattern_no_alias_in, sql, re.IGNORECASE)):
+                errors.append(
+                    f"Security violation: Table '{real}' contains customer data but the query is missing "
+                    f"the required organization filter (zecure_org_id = '{org_id}')."
+                )
+                
+    return errors

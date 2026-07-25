@@ -70,13 +70,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "generate_pdf":
         from fpdf import FPDF
+        import datetime
 
         question = arguments["question"]
         sql      = arguments["sql"]
         rows     = arguments["rows"]
 
         path = os.path.join(REPORTS_DIR, "report.pdf")
-        pdf = FPDF()
+        
+        # Current generation timestamp for footer
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        class CustomPDF(FPDF):
+            def footer(self):
+                self.set_y(-15)
+                self.set_font("Helvetica", "I", 8)
+                self.set_text_color(150, 150, 150)
+                # Left aligned: timestamp
+                self.cell(150, 10, f"Generated: {current_time}", border=0, align="L")
+                # Right aligned: page numbering
+                self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", border=0, align="R")
+
+        pdf = CustomPDF()
+        pdf.alias_nb_pages()
         pdf.set_margins(15, 15, 15)
         
         # Determine orientation based on column count
@@ -104,7 +120,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if rows:
             pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(0, 8, "Data:", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 8, f"Data (Total: {len(rows)} rows):", new_x="LMARGIN", new_y="NEXT")
             df = pd.DataFrame(rows)
             headers = list(df.columns)
             
@@ -133,8 +149,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             pdf.set_font("Helvetica", "", font_size)
             pdf.set_text_color(0, 0, 0)
             for i, (_, row) in enumerate(df.iterrows()):
-                if i >= 200:
-                    break
+                # No limit here! Prints all rows.
                 for h in headers:
                     max_chars = max(3, int(col_widths[h] / (font_size * 0.25)))
                     pdf.cell(col_widths[h], 6, str(row[h])[:max_chars], border=1)

@@ -105,11 +105,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             with _get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(sql)
-                    # Hard limit to 1000 rows to prevent OOM/crashing on massive production tables
-                    rows = [dict(r) for r in cur.fetchmany(1000)]
+                    # Hard limit to 5000 rows for UI to prevent OOM/crashing on massive production tables
+                    rows = [dict(r) for r in cur.fetchmany(5000)]
                     has_more = cur.fetchone() is not None
                     
-            response_data = {"rows": rows, "row_count": len(rows), "has_more": has_more}
+                    total_count = len(rows)
+                    if has_more:
+                        try:
+                            # Wrap SQL in a COUNT subquery to get the exact total matching records
+                            count_sql = f"SELECT COUNT(*) AS cnt FROM ({sql}) as subq"
+                            cur.execute(count_sql)
+                            cnt_row = cur.fetchone()
+                            total_count = cnt_row["cnt"] if cnt_row else len(rows)
+                        except Exception:
+                            pass
+                    
+            response_data = {
+                "rows": rows, 
+                "row_count": len(rows), 
+                "total_count": total_count,
+                "has_more": has_more
+            }
             return [TextContent(type="text", text=json.dumps(response_data, default=str))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
@@ -121,14 +137,35 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             with _get_connection() as conn:
                 with conn.cursor() as cur:
                     for table in tables:
+                        # Fetch table comment
+                        cur.execute("SELECT obj_description(%s::regclass, 'pg_class') AS tbl_comment;", (table,))
+                        t_row = cur.fetchone()
+                        tbl_comment = t_row["tbl_comment"] if t_row else None
+                        
+                        # Fetch columns and their comments
                         cur.execute("""
-                            SELECT column_name, data_type FROM information_schema.columns
+                            SELECT column_name, data_type,
+                                   col_description(%s::regclass, ordinal_position) AS col_comment
+                            FROM information_schema.columns
                             WHERE table_schema = 'public' AND table_name = %s
                             ORDER BY ordinal_position;
-                        """, (table,))
+                        """, (table, table))
                         cols = cur.fetchall()
-                        col_str = ", ".join(f"{c['column_name']} {c['data_type']}" for c in cols)
-                        ddls.append(f"Table {table} ({col_str})")
+                        
+                        col_defs = []
+                        for c in cols:
+                            cd = f"{c['column_name']} {c['data_type']}"
+                            if c['col_comment']:
+                                clean_c = c['col_comment'].strip().replace('\n', ' ')
+                                cd += f" -- {clean_c}"
+                            col_defs.append(cd)
+                        col_str = ", ".join(col_defs)
+                        
+                        if tbl_comment:
+                            clean_t = tbl_comment.strip().replace('\n', ' ')
+                            ddls.append(f"Table {table} ({col_str}) -- Table Comment: {clean_t}")
+                        else:
+                            ddls.append(f"Table {table} ({col_str})")
             return [TextContent(type="text", text=json.dumps({"schema": "\n".join(ddls)}))]
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]

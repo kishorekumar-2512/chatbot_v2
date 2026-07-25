@@ -153,7 +153,7 @@ async def generate_answer(question: str, rows: list[dict], generate_fn, quick_st
 
     prompt = EXPLAIN_PROMPT.format(
         question=question,
-        row_count=len(rows),
+        row_count=getattr(rows, "total_count", len(rows)),
         sample_rows=json.dumps(safe_sample, default=str),
         stats_block=stats_block,
     )

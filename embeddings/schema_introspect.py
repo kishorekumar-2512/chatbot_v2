@@ -59,7 +59,7 @@ def _fetch_foreign_keys(cur, table: str) -> list[dict]:
     return cur.fetchall()
 
 
-def introspect_table(cur, table: str, manual_override: str | None = None) -> dict:
+def introspect_table(cur, table: str, manual_override: str | None = None, column_overrides: dict[str, str] | None = None) -> dict:
     """
     Returns {table_name, description, raw_ddl, content_hash, source}.
     `source` is one of "manual" / "db_comment" / "auto" — surfaced so you can
@@ -69,8 +69,28 @@ def introspect_table(cur, table: str, manual_override: str | None = None) -> dic
     table_comment = _fetch_table_comment(cur, table)
     fks = _fetch_foreign_keys(cur, table)
 
-    col_defs = ", ".join(f"{c['column_name']} ({c['data_type']})" for c in columns)
-    raw_ddl = f"Table {table} ({col_defs})"
+    # Merge column overrides
+    if column_overrides:
+        for c in columns:
+            col_name = c["column_name"]
+            if col_name in column_overrides:
+                c["col_comment"] = column_overrides[col_name]
+
+    col_defs_list = []
+    for c in columns:
+        col_def = f"{c['column_name']} ({c['data_type']})"
+        if c['col_comment']:
+            # Clean newlines from comment to keep DDL format neat
+            clean_comment = c['col_comment'].strip().replace('\n', ' ')
+            col_def += f" -- {clean_comment}"
+        col_defs_list.append(col_def)
+    col_defs = ", ".join(col_defs_list)
+    
+    if table_comment:
+        clean_table_comment = table_comment.strip().replace('\n', ' ')
+        raw_ddl = f"Table {table} ({col_defs}) -- Table Comment: {clean_table_comment}"
+    else:
+        raw_ddl = f"Table {table} ({col_defs})"
 
     # Content fingerprint — anything in here changing means the description
     # (and the embedding built from it) is stale and needs regenerating.
@@ -82,26 +102,31 @@ def introspect_table(cur, table: str, manual_override: str | None = None) -> dic
     ])
     content_hash = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()[:16]
 
+    # Build base description
     if manual_override:
-        return {"table_name": table, "description": manual_override, "raw_ddl": raw_ddl,
-                "content_hash": content_hash, "source": "manual"}
-
-    if table_comment:
-        # DB-documented — still enrich with FK relationship hints, which
-        # COMMENT ON TABLE text usually won't restate.
+        desc = manual_override.strip()
+        source = "manual"
+    elif table_comment:
         fk_hint = _fk_hint(fks)
         desc = f"Table '{table}': {table_comment.strip()}"
         if fk_hint:
             desc += f" {fk_hint}"
-        return {"table_name": table, "description": desc, "raw_ddl": raw_ddl,
-                "content_hash": content_hash, "source": "db_comment"}
+        source = "db_comment"
+    else:
+        desc = _auto_description(table, columns, fks)
+        source = "auto"
 
-    # Fully auto-synthesized fallback — still meaningfully better than just
-    # listing columns, because it surfaces relationships and column-level
-    # comments if any individual columns (but not the table) are documented.
-    desc = _auto_description(table, columns, fks)
+    # Append ALL documented column descriptions so they are indexed in embeddings
+    col_descs = []
+    for c in columns:
+        if c["col_comment"]:
+            col_descs.append(f"{c['column_name']}: {c['col_comment'].strip()}")
+    
+    if col_descs:
+        desc = f"{desc} Columns: {'; '.join(col_descs)}."
+
     return {"table_name": table, "description": desc, "raw_ddl": raw_ddl,
-            "content_hash": content_hash, "source": "auto"}
+            "content_hash": content_hash, "source": source}
 
 
 def _fk_hint(fks: list[dict]) -> str:
@@ -145,11 +170,11 @@ def list_tables(cur) -> list[str]:
     return [r["table_name"] for r in cur.fetchall()]
 
 
-def introspect_all(database_url: str, manual_overrides: dict[str, str]) -> list[dict]:
+def introspect_all(database_url: str, manual_overrides: dict[str, str], column_overrides: dict[str, dict[str, str]] | None = None) -> list[dict]:
     conn = psycopg2.connect(database_url, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         with conn.cursor() as cur:
             tables = list_tables(cur)
-            return [introspect_table(cur, t, manual_overrides.get(t)) for t in tables]
+            return [introspect_table(cur, t, manual_overrides.get(t), column_overrides.get(t) if column_overrides else None) for t in tables]
     finally:
         conn.close()

@@ -4,6 +4,7 @@ import useChat from '../../hooks/useChat.js';
 import MessageBubble from './MessageBubble.jsx';
 import ThinkingStream from './ThinkingStream.jsx';
 import ChatInput from './ChatInput.jsx';
+import HomeDashboard from './HomeDashboard.jsx';
 
 /**
  * ChatPanel — main chat container with message list, streaming, and input.
@@ -13,7 +14,7 @@ export default function ChatPanel() {
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamingStatus = useChatStore((s) => s.streamingStatus);
   const thinkingTokens = useChatStore((s) => s.thinkingTokens);
-  const { send, rerunSQL } = useChat();
+  const { send, rerunSQL, stopStreaming } = useChat();
   const bottomRef = useRef(null);
 
   /* Auto-scroll on new messages or thinking tokens */
@@ -29,16 +30,7 @@ export default function ChatPanel() {
       <div className="chat-messages">
         <div className="chat-messages__inner">
           {messages.length === 0 ? (
-            /* ── Welcome screen ── */
-            <div className="chat-welcome">
-              <div className="chat-welcome__icon">🗃️</div>
-              <h1 className="chat-welcome__title">AI Database Assistant</h1>
-              <p className="chat-welcome__subtitle">
-                Ask questions about your database in plain English. 
-                I'll generate SQL, run it, and show you results with charts, 
-                insights, and confidence scoring.
-              </p>
-            </div>
+            <HomeDashboard onSelectSuggestion={send} />
           ) : (
             /* ── Message list ── */
             messages.map((msg) => (
@@ -66,6 +58,13 @@ export default function ChatPanel() {
           <div ref={bottomRef} />
         </div>
       </div>
+
+      {isStreaming && (
+        <button className="chat-input-stop" onClick={stopStreaming} title="Stop generating">
+          <span className="chat-input-stop__dot" />
+          Stop generating
+        </button>
+      )}
 
       <ChatInput onSend={send} />
     </div>

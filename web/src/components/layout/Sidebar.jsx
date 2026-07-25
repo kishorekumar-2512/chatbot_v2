@@ -1,19 +1,26 @@
-import { useEffect } from 'react';
+import React, { useEffect } from 'react';
 import useChatStore from '../../stores/chatStore.js';
 import useSchema from '../../hooks/useSchema.js';
-import { EXAMPLE_QUERIES } from '../../utils/constants.js';
+import { 
+  Plus, 
+  Home, 
+  Activity, 
+  Server,
+  MessageSquare,
+  ShieldCheck,
+  ChevronLeft
+} from 'lucide-react';
 import { formatTimeAgo, truncate } from '../../utils/formatters.js';
-import SchemaExplorer from '../schema/SchemaExplorer.jsx';
 
 /**
- * Sidebar — collapsible panel with quick queries, model health, schema browser, and history.
+ * Sidebar — collapsible panel with dashboard navigation, system health alerts, and query history.
  */
 export default function Sidebar({ onSelectQuery }) {
   const queryHistory = useChatStore((s) => s.queryHistory);
-  const schemaData = useChatStore((s) => s.schemaData);
   const circuitStatus = useChatStore((s) => s.circuitStatus);
   const clearMessages = useChatStore((s) => s.clearMessages);
-  const { loadSchema, refreshCircuit } = useSchema();
+  const toggleSidebar = useChatStore((s) => s.toggleSidebar);
+  const { refreshCircuit } = useSchema();
 
   useEffect(() => {
     refreshCircuit();
@@ -32,90 +39,106 @@ export default function Sidebar({ onSelectQuery }) {
       if (data.circuit_open === false) state = 'closed';
       else if (data.circuit_open === true) state = data.seconds_until_recovery_attempt ? 'recovery' : 'open';
       
-      const failures = data.consecutive_failures ?? '?';
-      tiers.push({ label, state, failures });
+      tiers.push({ label, state });
     }
   }
 
   return (
-    <div className="sidebar">
-      {/* ── Header ── */}
+    <aside className="sidebar">
+      {/* Header */}
       <div className="sidebar__header">
         <div className="sidebar__logo">
-          <div className="sidebar__logo-icon">🗃️</div>
-          <span className="sidebar__logo-text">AI Database</span>
+          <div className="sidebar__logo-icon">
+            <Server className="w-5 h-5 text-indigo-400" />
+          </div>
+          <span className="sidebar__logo-text">Antigravity DB</span>
         </div>
+        <button className="sidebar-collapse-btn" onClick={toggleSidebar} title="Collapse sidebar">
+          <ChevronLeft className="w-4 h-4 text-zinc-500 hover:text-zinc-200" />
+        </button>
       </div>
 
       <div className="sidebar__content">
-        {/* ── Quick Queries ── */}
+        {/* New Chat Button */}
+        <button className="new-chat-btn" onClick={() => {
+          clearMessages();
+          if (window.innerWidth <= 1024) toggleSidebar();
+        }}>
+          <Plus className="w-4 h-4 mr-2" />
+          <span>New Query</span>
+        </button>
+
+        {/* Navigation */}
         <div className="sidebar__section">
-          <div className="sidebar__section-title">Quick Queries</div>
-          {EXAMPLE_QUERIES.map((q, i) => (
-            <button key={i} className="example-query" onClick={() => onSelectQuery(q)}>
-              {q}
+          <div className="sidebar__section-title">Navigation</div>
+          <nav className="sidebar__nav">
+            <button className="nav-item active" onClick={() => {
+              clearMessages();
+              if (window.innerWidth <= 1024) toggleSidebar();
+            }}>
+              <Home className="w-4 h-4 mr-3" />
+              <span>Home Dashboard</span>
             </button>
-          ))}
+          </nav>
         </div>
 
-        {/* ── Model Health ── */}
+        {/* Model Health */}
         <div className="sidebar__section">
           <div className="sidebar__section-title">Model Health</div>
           <div className="circuit-status">
             {tiers.length > 0 ? tiers.map((t) => (
               <div key={t.label} className="circuit-tier">
-                <span className="circuit-tier__name">{t.label}</span>
+                <div className="circuit-tier__info">
+                  <Activity className="w-3.5 h-3.5 text-zinc-500 mr-2" />
+                  <span className="circuit-tier__name">{t.label}</span>
+                </div>
                 <span className={`circuit-tier__state ${t.state}`}>
-                  {t.state === 'closed' ? '● Active' : t.state === 'open' ? '○ Open' : '◐ Recovery'}
+                  <span className="heartbeat-dot" />
+                  {t.state === 'closed' ? 'Active' : (t.state === 'open' ? 'Open' : 'Recovery')}
                 </span>
               </div>
             )) : (
-              <div style={{ color: 'var(--text-muted)', fontSize: 'var(--text-sm)' }}>
-                Loading…
+              <div className="sidebar-loading">
+                <span>Checking health...</span>
               </div>
             )}
           </div>
         </div>
 
-        {/* ── Schema Browser ── */}
-        <div className="sidebar__section">
-          <div className="sidebar__section-title">Schema Browser</div>
-          {schemaData ? (
-            <SchemaExplorer data={schemaData} />
-          ) : (
-            <button className="btn btn-secondary btn-sm" onClick={loadSchema}>
-              📂 Load Schema
-            </button>
-          )}
-        </div>
-
-        {/* ── Recent Queries ── */}
+        {/* Recent Queries */}
         <div className="sidebar__section">
           <div className="sidebar__section-title">Recent Queries</div>
-          {queryHistory.slice(0, 10).map((item, i) => (
-            <div
-              key={i}
-              className="history-item"
-              onClick={() => onSelectQuery(item.question)}
-            >
-              <div className="history-item__question">{truncate(item.question, 60)}</div>
-              <div className="history-item__time">{formatTimeAgo(item.timestamp)}</div>
-            </div>
-          ))}
-          {queryHistory.length === 0 && (
-            <div style={{ color: 'var(--text-muted)', fontSize: 'var(--text-sm)', padding: 'var(--space-2)' }}>
-              No queries yet
-            </div>
-          )}
+          <div className="recent-queries-list">
+            {queryHistory.slice(0, 8).map((item, i) => (
+              <div
+                key={i}
+                className="recent-query-item"
+                onClick={() => onSelectQuery(item.question)}
+                title={item.question}
+              >
+                <MessageSquare className="w-3.5 h-3.5 text-zinc-500 flex-shrink-0 mr-2.5 mt-0.5" />
+                <div className="recent-query-item__details">
+                  <span className="recent-query-item__text">{truncate(item.question, 40)}</span>
+                  <span className="recent-query-item__time">{formatTimeAgo(item.timestamp)}</span>
+                </div>
+              </div>
+            ))}
+            {queryHistory.length === 0 && (
+              <div className="sidebar-empty">
+                No recent queries
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* ── Footer ── */}
+      {/* Footer */}
       <div className="sidebar__footer">
-        <button className="btn btn-ghost btn-sm" onClick={clearMessages} style={{ width: '100%' }}>
-          ↺ New Conversation
-        </button>
+        <div className="security-badge">
+          <ShieldCheck className="w-4 h-4 text-indigo-400 mr-2" />
+          <span>Tenant Isolation Active</span>
+        </div>
       </div>
-    </div>
+    </aside>
   );
 }
