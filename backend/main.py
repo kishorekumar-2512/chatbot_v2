@@ -18,6 +18,7 @@ from typing import Optional
 
 import psycopg2, psycopg2.extras, psycopg2.pool
 from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -64,7 +65,7 @@ from backend.insights import compute_quick_stats, generate_followups
 from backend.chart_builder import build_chart
 from backend.auth import get_current_user, AuthenticatedUser, REQUIRE_AUTH
 
-load_dotenv()
+# load_dotenv() - already called at the top
 
 DATABASE_URL    = os.getenv("DATABASE_URL")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:8501")
