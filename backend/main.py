@@ -845,7 +845,7 @@ Question: {question}
         # block off mid-query — a real contributor to both the retries
         # (slowness) and the wrong-answer rate (accuracy) reported after
         # this was added.
-        customer_result = await call_customer_llm(prompt, max_tokens=gen_max_tokens)
+        customer_result = await call_customer_llm(prompt, customer_id=org_id or "default", max_tokens=gen_max_tokens)
         if customer_result:
             raw, model_used = customer_result
         else:
@@ -980,7 +980,7 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     if image_base64:
         yield {"type": "status", "stage": "vision", "message": "👁️ Analyzing uploaded image using Vision Agent..."}
         try:
-            chart_descriptions = await analyze_dashboard_with_gemini(image_base64)
+            chart_descriptions = await analyze_dashboard_with_gemini(image_base64, customer_id=org_id or "default")
             num_charts = len(chart_descriptions)
 
             if num_charts > 1:
@@ -1131,7 +1131,7 @@ Question: {question}
                "message": f"🧠 Generating SQL — attempt {attempt}/{MAX_ATTEMPTS}..."}
 
         raw = ""
-        customer_result = await call_customer_llm(prompt, max_tokens=gen_max_tokens)
+        customer_result = await call_customer_llm(prompt, customer_id=org_id or "default", max_tokens=gen_max_tokens)
         if customer_result:
             raw, model_used = customer_result
             yield {"type": "thinking_token", "text": raw, "model": model_used}
