@@ -48,7 +48,7 @@ except ImportError:
     def retrieve_tables(*a, **kw): return {"tables_used": [], "similarity_scores": {}, "schema_text": ""}
     def get_similar_examples(*a, **kw): return ""
     def store_successful_example(*a, **kw): pass
-    def build_value_hints(*a, **kw): return ""
+    async def build_value_hints(*a, **kw): return ""
     def get_schema_for_tables(*a, **kw): return ""
 
 from backend.llm_key_store import (
