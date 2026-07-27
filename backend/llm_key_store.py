@@ -201,25 +201,36 @@ async def call_customer_llm(prompt: str, customer_id: str = "default", max_token
     Try the customer's own LLM keys in priority order.
     Returns (response_text, model_label) or None if no customer keys configured.
     Priority: openai → anthropic → groq → gemini → ollama
+
+    Looks up keys under `customer_id` first; if nothing found, falls back to
+    the "default" bucket so BYO keys saved from the Settings UI always work.
     """
     priority = ["openai", "anthropic", "deepseek", "groq", "gemini", "ollama"]
     store = _load_store()
-    customer_keys = store.get(customer_id, {})
 
-    for provider in priority:
-        if provider not in customer_keys:
+    # Try org-specific keys first, then fall back to "default"
+    buckets_to_try = [customer_id]
+    if customer_id != "default":
+        buckets_to_try.append("default")
+
+    for bucket in buckets_to_try:
+        customer_keys = store.get(bucket, {})
+        if not customer_keys:
             continue
-        entry = customer_keys[provider]
-        if not entry.get("enabled"):
-            continue
-        try:
-            key   = _simple_decrypt(entry["encrypted_key"])
-            model = entry.get("model", "")
-            text  = await _call_provider(provider, key, model, prompt, max_tokens)
-            if text:
-                return text, f"{SUPPORTED_PROVIDERS[provider]['name']} ({model})"
-        except Exception:
-            continue
+        for provider in priority:
+            if provider not in customer_keys:
+                continue
+            entry = customer_keys[provider]
+            if not entry.get("enabled"):
+                continue
+            try:
+                key   = _simple_decrypt(entry["encrypted_key"])
+                model = entry.get("model", "")
+                text  = await _call_provider(provider, key, model, prompt, max_tokens)
+                if text:
+                    return text, f"{SUPPORTED_PROVIDERS[provider]['name']} ({model})"
+            except Exception:
+                continue
     return None
 
 
