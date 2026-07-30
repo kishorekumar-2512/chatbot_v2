@@ -49,10 +49,10 @@ OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 # supports up to 32k context; 8192 is a safe, fast default.
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL       = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 FAILURE_THRESHOLD   = 3            # consecutive failures before opening circuit

@@ -20,16 +20,12 @@ KEY_STORE_PATH = os.getenv("KEY_STORE_PATH", "./data/llm_keys.json")
 _SALT = "zecure_llm_salt_v1"   # in production, use a proper secret
 
 SUPPORTED_PROVIDERS = {
-    # Model lists current as of July 2026 — several previous defaults here
-    # had been deprecated/shut down by their providers:
-    #   Groq retired llama-3.3-70b-versatile & mixtral-8x7b-32768 (June 2026)
-    #   Google shut down gemini-2.0-flash (June 2026) and the whole 1.5 line
-    "openai":    {"name": "OpenAI",           "models": ["gpt-5.5", "gpt-5.4-mini", "gpt-4o-mini"],                "url": "https://api.openai.com/v1/chat/completions"},
-    "anthropic": {"name": "Anthropic (Claude)","models": ["claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001"], "url": "https://api.anthropic.com/v1/messages"},
-    "deepseek":  {"name": "DeepSeek",         "models": ["deepseek-v4-flash", "deepseek-v4-pro"],                  "url": "https://api.deepseek.com/chat/completions"},
-    "groq":      {"name": "Groq",             "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"], "url": "https://api.groq.com/openai/v1/chat/completions"},
-    "gemini":    {"name": "Google Gemini",    "models": ["gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.1-pro"], "url": "https://generativelanguage.googleapis.com/v1beta/models"},
-    "ollama":    {"name": "Ollama (Local)",   "models": ["qwen2.5-coder:7b", "qwen2.5-coder:14b", "qwen2.5:3b", "llama3.2"], "url": "http://localhost:11434"},
+    "openai":    {"name": "OpenAI",            "models": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],               "url": "https://api.openai.com/v1/chat/completions"},
+    "anthropic": {"name": "Anthropic (Claude)", "models": ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"], "url": "https://api.anthropic.com/v1/messages"},
+    "deepseek":  {"name": "DeepSeek",          "models": ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],  "url": "https://api.deepseek.com/chat/completions"},
+    "groq":      {"name": "Groq",              "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "deepseek-r1-distill-llama-70b"], "url": "https://api.groq.com/openai/v1/chat/completions"},
+    "gemini":    {"name": "Google Gemini",     "models": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"], "url": "https://generativelanguage.googleapis.com/v1beta/models"},
+    "ollama":    {"name": "Ollama (Local)",    "models": ["qwen2.5-coder:7b", "llama3.2", "qwen2.5:7b"],            "url": "http://localhost:11434"},
 }
 
 
@@ -61,10 +57,12 @@ def _save_store(store: dict):
         json.dump(store, f, indent=2)
 
 
-def save_key(provider: str, api_key: str, model: str, customer_id: str = "default") -> dict:
+def save_key(provider: str, api_key: str, model: str = "", customer_id: str = "default") -> dict:
     """Save a customer's API key for a provider."""
     if provider not in SUPPORTED_PROVIDERS:
         return {"success": False, "error": f"Unknown provider: {provider}"}
+    if not model or not model.strip():
+        model = SUPPORTED_PROVIDERS[provider]["models"][0]
     store = _load_store()
     if customer_id not in store:
         store[customer_id] = {}
@@ -93,7 +91,12 @@ def get_key(provider: str, customer_id: str = "default") -> Optional[str]:
 def get_model(provider: str, customer_id: str = "default") -> Optional[str]:
     store = _load_store()
     entry = store.get(customer_id, {}).get(provider)
-    return entry.get("model") if entry else None
+    if not entry:
+        return None
+    model = entry.get("model")
+    if not model or not model.strip():
+        model = SUPPORTED_PROVIDERS.get(provider, {}).get("models", [""])[0]
+    return model
 
 
 def get_all_keys(customer_id: str = "default") -> dict:
@@ -110,7 +113,7 @@ def get_all_keys(customer_id: str = "default") -> dict:
         result[provider] = {
             "provider": provider,
             "provider_name": SUPPORTED_PROVIDERS.get(provider, {}).get("name", provider),
-            "model": entry.get("model", ""),
+            "model": entry.get("model", SUPPORTED_PROVIDERS.get(provider, {}).get("models", [""])[0]),
             "enabled": entry.get("enabled", True),
             "key_preview": key,
         }
@@ -135,11 +138,16 @@ def toggle_key(provider: str, enabled: bool, customer_id: str = "default") -> di
     return {"success": False, "error": "Key not found"}
 
 
-async def validate_key(provider: str, api_key: str, model: str) -> dict:
+async def validate_key(provider: str, api_key: str, model: str = "") -> dict:
     """
     Test an API key with a minimal request before saving.
     Returns {"valid": bool, "error": str|None}
     """
+    if not model or not model.strip():
+        if provider in SUPPORTED_PROVIDERS:
+            model = SUPPORTED_PROVIDERS[provider]["models"][0]
+        else:
+            model = ""
     test_prompt = "Reply with the single word: OK"
     try:
         if provider == "openai":
