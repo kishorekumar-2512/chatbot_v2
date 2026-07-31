@@ -230,82 +230,91 @@ async def call_customer_llm(prompt: str, customer_id: str = "default", max_token
     for bucket in buckets_to_try:
         customer_keys = store.get(bucket, {})
         if not customer_keys:
-            logger.info(f"[BYO] Bucket '{bucket}' — empty, skipping")
+            logger.info(f"[LLM Routing] Bucket '{bucket}' empty — checking next bucket...")
             continue
-        logger.info(f"[BYO] Bucket '{bucket}' — providers: {list(customer_keys.keys())}")
+        logger.info(f"[LLM Routing] Found configured BYO providers for '{bucket}': {list(customer_keys.keys())}")
         for provider in priority:
             if provider not in customer_keys:
                 continue
             entry = customer_keys[provider]
             if not entry.get("enabled"):
-                logger.info(f"[BYO] Bucket '{bucket}', provider '{provider}' — disabled, skipping")
+                logger.info(f"[LLM Routing] BYO key for provider '{provider}' is disabled — skipping")
                 continue
             try:
                 key   = _simple_decrypt(entry["encrypted_key"])
                 model = entry.get("model", "")
-                logger.info(f"[BYO] Trying bucket '{bucket}', provider '{provider}', model '{model}'...")
+                logger.info(f"[LLM Routing] 🔑 Using BYO API key for provider '{provider}' (model: '{model}')")
                 text  = await _call_provider(provider, key, model, prompt, max_tokens)
                 if text:
-                    logger.info(f"[BYO] ✅ Success from '{provider}' ({model}) — {len(text)} chars")
+                    logger.info(f"[LLM Routing] ✅ BYO Provider '{provider}' ({model}) successfully returned response ({len(text)} chars)")
                     return text, f"{SUPPORTED_PROVIDERS[provider]['name']} ({model})"
                 else:
-                    logger.warning(f"[BYO] Provider '{provider}' returned empty text")
+                    logger.warning(f"[LLM Routing] BYO Provider '{provider}' returned empty response")
             except Exception as e:
-                logger.warning(f"[BYO] ❌ Provider '{provider}' failed: {type(e).__name__}: {e}")
+                logger.warning(f"[LLM Routing] ❌ BYO Provider '{provider}' execution failed: {type(e).__name__}: {e}")
                 continue
-    logger.info("[BYO] No BYO keys succeeded — falling through to model router")
+    logger.info(f"[LLM Routing] No active BYO key available for customer '{customer_id}' — falling back to system circuit breaker chain (Groq -> Gemini -> Qwen)")
     return None
 
 
 async def _call_provider(provider: str, api_key: str, model: str, prompt: str, max_tokens: int) -> Optional[str]:
     import logging
+    import asyncio
     logger = logging.getLogger("uvicorn.error")
 
-    # Use generous timeouts: 30s connect, 120s read for cloud APIs
+    # Generous timeouts: 30s connect, 120s read for cloud APIs
     cloud_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-    transport = httpx.AsyncHTTPTransport(retries=2)  # auto-retry on connection errors
 
-    if provider in ("openai", "groq", "deepseek"):
-        # All three use an identical OpenAI-compatible chat completions shape —
-        # only the base URL differs (already encoded in SUPPORTED_PROVIDERS).
-        async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-            r = await c.post(
-                SUPPORTED_PROVIDERS[provider]["url"],
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+    for attempt in range(1, 4):
+        try:
+            transport = httpx.AsyncHTTPTransport(retries=2)
+            if provider in ("openai", "groq", "deepseek"):
+                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
+                    r = await c.post(
+                        SUPPORTED_PROVIDERS[provider]["url"],
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
+                    )
+                    r.raise_for_status()
+                    return r.json()["choices"][0]["message"]["content"].strip()
 
-    elif provider == "anthropic":
-        async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-            r = await c.post(
-                SUPPORTED_PROVIDERS["anthropic"]["url"],
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
-            )
-            r.raise_for_status()
-            return r.json()["content"][0]["text"].strip()
+            elif provider == "anthropic":
+                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
+                    r = await c.post(
+                        SUPPORTED_PROVIDERS["anthropic"]["url"],
+                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                        json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+                    )
+                    r.raise_for_status()
+                    return r.json()["content"][0]["text"].strip()
 
-    elif provider == "gemini":
-        url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={api_key}"
-        async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-            r = await c.post(url, json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
-            })
-            r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            elif provider == "gemini":
+                url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={api_key}"
+                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
+                    r = await c.post(url, json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
+                    })
+                    r.raise_for_status()
+                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    elif provider == "ollama":
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as c:
-            r = await c.post(
-                f"{SUPPORTED_PROVIDERS['ollama']['url']}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False,
-                      "options": {"num_predict": max_tokens, "temperature": 0.1}},
-            )
-            r.raise_for_status()
-            return r.json()["response"].strip()
+            elif provider == "ollama":
+                async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as c:
+                    r = await c.post(
+                        f"{SUPPORTED_PROVIDERS['ollama']['url']}/api/generate",
+                        json={"model": model, "prompt": prompt, "stream": False,
+                              "options": {"num_predict": max_tokens, "temperature": 0.1}},
+                    )
+                    r.raise_for_status()
+                    return r.json()["response"].strip()
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError, httpx.PoolTimeout) as net_err:
+            logger.warning(f"[BYO] Network error on attempt {attempt}/3 for {provider}: {net_err}")
+            if attempt < 3:
+                await asyncio.sleep(1.0 * attempt)
+                continue
+            raise net_err
+        except Exception as e:
+            raise e
 
     return None
 

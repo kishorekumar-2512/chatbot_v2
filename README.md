@@ -1,6 +1,6 @@
-# AI Database Report Chatbot v2
+# AI Database Report Chatbot v2 (Antigravity DB)
 
-> **Natural-Language → SQL → Charts → Insights** — powered by a 6-layer RAG pipeline, circuit-breaker LLM routing, and multimodal vision.
+> **Natural-Language → SQL → Charts → Insights** — powered by a 6-layer RAG pipeline, circuit-breaker LLM routing, PostgreSQL RLS security, and multimodal vision.
 
 Ask questions about your database in plain English. The system generates validated SQL, executes it, and returns results with auto-selected charts, written explanations, confidence scores, and live streaming of the model's reasoning.
 
@@ -14,14 +14,13 @@ Ask questions about your database in plain English. The system generates validat
 | **GraphRAG** | NetworkX FK-relationship graph computes correct JOIN paths automatically |
 | **Corrective RAG** | Self-healing SQL: auto-repair, retry, zero-row diagnosis, model escalation |
 | **Multimodal RAG** | Upload chart/dashboard images → Gemini Vision extracts data requirements → SQL |
-| **Multi-Chart Dashboards** | Upload a screenshot with multiple charts → generates separate queries for each |
-| **Circuit Breaker** | Qwen (local) → Groq → Gemini failover chain with automatic recovery |
+| **Circuit Breaker** | Groq (primary) → Gemini (fallback 1) → Qwen/Ollama (fallback 2) failover chain with 300s auto-recovery across all models |
 | **BYO Keys** | Bring your own API keys for OpenAI, Anthropic, DeepSeek, Groq, Gemini, Ollama |
 | **Live Streaming** | SSE pipeline streams model reasoning tokens and progress to the UI in real time |
 | **Smart Charts** | Auto-selects line, area, bar, grouped bar, donut, or animated counter by data shape |
 | **Confidence Scoring** | 4-signal weighted score: table relevance, column accuracy, attempt score, row sanity |
-| **Multi-Turn Context** | Follow-up questions carry forward table context and previous SQL |
-| **Multi-Tenant Security** | Org-level data isolation via `zecure_org_id` filtering |
+| **Multi-Tenant Security** | App-level `zecure_org_id` AST filtering + optional Postgres Row-Level Security (RLS) policies |
+| **Fail-Secure Auth** | Pluggable JWT/OIDC authentication (`REQUIRE_AUTH=true` by default, set `false` for local dev) |
 
 ---
 
@@ -44,33 +43,36 @@ Ask questions about your database in plain English. The system generates validat
 │  L5  Validation + self-correction + auto-repair    │
 │  L6  Multimodal RAG (Gemini Vision Agent)          │
 │                                                    │
-│  Circuit Breaker Router: Qwen → Groq → Gemini     │
+│  Circuit Breaker Router: Groq → Gemini → Qwen     │
 └──────────────────┬───────────────────────────────┘
                    │
        ┌───────────▼────────────┐
        │     PostgreSQL DB      │
-       │     (234 tables)       │
+       │  (App AST + RLS Rules) │
        └────────────────────────┘
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Clean & Error-Free)
 
 ### Prerequisites
 
 | Tool | Required | Purpose |
 |------|----------|---------|
-| Python 3.10+ | ✅ | Backend, embeddings, MCP servers |
+| Python 3.10+ | ✅ | Backend, embeddings, indexer |
 | Node.js 18+ | ✅ | React frontend |
-| PostgreSQL | ✅ | The database being queried |
-| Ollama | Optional | Local LLM (Qwen 2.5 Coder 7B) |
+| PostgreSQL | ✅ | Target relational database |
+| Ollama | Optional | Local LLM (`qwen2.5-coder:7b`) |
 | Docker | Optional | Containerized deployment |
 
 ### 1. Install dependencies
 
 ```bash
+# Python backend dependencies
 pip install -r requirements.txt
+
+# React frontend dependencies
 cd web && npm install && cd ..
 ```
 
@@ -78,106 +80,67 @@ cd web && npm install && cd ..
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum set DATABASE_URL
 ```
 
-### 3. Build the embedding index (run once)
+Edit your `.env` file:
+```env
+DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/your_database
+FRONTEND_ORIGIN=http://localhost:5173
+REQUIRE_AUTH=false
+GROQ_API_KEY=your_groq_key_here
+GEMINI_API_KEY=your_gemini_key_here
+```
+*(Note: Set `REQUIRE_AUTH=false` for local dev so authentication is bypassed. Set `true` in production with JWT JWKS).*
+
+### 3. Build the embedding index
 
 ```bash
-python embeddings/build_index.py
+python -m embeddings.build_index
+```
+*(Runs an incremental sync introspecting your PostgreSQL schema and building ChromaDB vector embeddings).*
+
+### 4. Enable Database Row-Level Security (Optional)
+
+```bash
+psql -d your_database -f migrations/001_enable_rls.sql
 ```
 
-### 4. Start the app
+### 5. Start the application
 
 ```bash
-# Terminal 1 (optional — only if using local Ollama)
-ollama serve
-
-# Terminal 2 — Backend
+# Terminal 1 — FastAPI Backend API
 uvicorn backend.main:app --reload --port 8000
 
-# Terminal 3 — React Frontend
+# Terminal 2 — React Web Frontend
 cd web && npm run dev
 ```
 
 Open **http://localhost:5173** in your browser.
 
-### Docker alternative
+---
+
+## 🐳 Running with Docker Compose
 
 ```bash
-cp .env.example .env   # edit with your values
+cp .env.example .env   # configure DATABASE_URL, GROQ_API_KEY, GEMINI_API_KEY, REQUIRE_AUTH=false
 docker compose up --build
-# Backend:  http://localhost:8000
-# Frontend: http://localhost:8080
 ```
+- Backend: **http://localhost:8000**
+- React Web UI: **http://localhost:8080**
 
 ---
 
-## 📖 Documentation
+## 📖 Documentation & Guides
 
-- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** — Detailed step-by-step setup for new contributors
-- **[DOCUMENTATION.md](DOCUMENTATION.md)** — Full technical architecture and engineering report
-- **[DEPLOYMENT.md](DEPLOYMENT.md)** — AWS deployment guide (ECS, S3, CloudFront, Terraform)
-
----
-
-## 🔑 Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | ✅ | PostgreSQL connection string |
-| `FRONTEND_ORIGIN` | ✅ | CORS origin (default: `http://localhost:5173`) |
-| `GROQ_API_KEY` | Recommended | Groq cloud fallback (free tier) |
-| `GEMINI_API_KEY` | Recommended | Gemini cloud fallback + Vision Agent (free tier) |
-| `OLLAMA_MODEL` | Optional | Local model name (default: `qwen2.5-coder:7b`) |
-| `PRIMARY_LLM` | Optional | Starting tier: `qwen` (default) or `groq` |
-| `RETRIEVAL_TOP_K` | Optional | Tables retrieved per query (default: 8) |
+- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** — Detailed step-by-step setup guide for new developers
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** — AWS ECS, Fargate, Terraform, and CI/CD deployment guide
+- **[migrations/001_enable_rls.sql](migrations/001_enable_rls.sql)** — PostgreSQL Row-Level Security migration script
 
 ---
 
-## 🛡 Security
+## 🛡 Security Policy
 
-- **Read-only SQL**: Every query is validated — `DROP`, `DELETE`, `UPDATE`, `INSERT` are blocked
-- **Multi-tenant**: `org_id` → `zecure_org_id` filtering enforced at the prompt level
-- **Rate limiting**: 10 requests/minute/IP via SlowAPI
-- **BYO keys**: Customer API keys stored encrypted in `data/llm_keys.json` (gitignored)
-
----
-
-## 📁 Project Structure
-
-```
-chatbot_v2/
-├── backend/
-│   ├── main.py              # FastAPI app + 6-layer pipeline
-│   ├── model_router.py      # Circuit-breaker LLM chain
-│   ├── llm_key_store.py     # BYO-key storage + Vision Agent
-│   ├── hybrid_retriever.py  # ChromaDB + BM25 retrieval
-│   ├── schema_graph.py      # NetworkX FK graph
-│   ├── query_intelligence.py# Intent detection
-│   ├── sql_validator.py     # Security + schema validation
-│   ├── self_correction.py   # Auto-repair + retry logic
-│   ├── chart_builder.py     # Shape-based chart selection
-│   ├── confidence.py        # 4-signal scoring
-│   └── Dockerfile
-├── embeddings/              # build_index.py, retrieve.py
-├── mcp_servers/             # database, schema, report servers
-├── web/                     # React SPA (Vite + Zustand)
-├── frontend/                # Legacy Streamlit UI
-├── deploy/                  # Terraform + CI/CD
-├── docker-compose.yml
-├── requirements.txt
-└── .env.example
-```
-
----
-
-## 📊 Confidence Scoring
-
-Every answer shows 4 progress bars:
-- **Table Relevance** — ChromaDB cosine similarity of selected tables
-- **Column Accuracy** — 100% if zero schema validation errors
-- **Attempt Score** — penalizes 2nd/3rd retries
-- **Row Sanity** — flags suspicious 0-row or >10k-row results
-
-Overall ≥80% = High | ≥55% = Medium | <55% = Low
+- **Read-Only Enforcer**: All write/DDL keywords (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, etc.) are blocked at AST validation.
+- **Fail-Secure Auth**: `REQUIRE_AUTH` defaults to `true` for production JWT/OIDC safety.
+- **Database RLS**: Multi-tenant isolation enforced both in application logic and optionally via Postgres RLS policies (`zecure_org_id`).
+- **Secrets Cleanliness**: `.env` and `.env.save` are strictly gitignored and excluded from repositories.

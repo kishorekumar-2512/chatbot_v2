@@ -80,10 +80,14 @@ class ModelState:
             self.opened_at = time.time()
 
     def should_attempt_recovery(self) -> bool:
-        """For non-primary tiers we don't auto-recover — only primary does."""
+        """Returns True if circuit is open and the recovery cooldown window has elapsed."""
         if not self.is_open or self.opened_at is None:
             return False
         return (time.time() - self.opened_at) >= RECOVERY_AFTER_SECS
+
+    def is_available(self) -> bool:
+        """Returns True if model is healthy (circuit closed) OR due for a recovery attempt."""
+        return not self.is_open or self.should_attempt_recovery()
 
 
 class CircuitBreakerRouter:
@@ -115,43 +119,23 @@ class CircuitBreakerRouter:
     def _active_chain(self, skip_tiers: set | None = None) -> list[ModelState]:
         """
         Returns the ordered list of models to try for this request.
-        Primary is always tried first UNLESS its circuit is open AND
-        recovery isn't due yet.
-
-        `skip_tiers` (e.g. {"qwen"}) lets a caller force escalation past a
-        tier that's already proven it can't fix a given error twice in a
-        row — no point burning a 3rd attempt on the same small local model
-        if it made the identical mistake on attempt 1 and 2.
+        All models (primary, fallback1, fallback2) check their circuit breaker state:
+        if circuit is closed OR cooldown timer has elapsed, the model is included.
+        If circuit is open and cooldown is active, the model is skipped.
         """
-        chain = []
+        candidates = [self.primary, self.fallback1, self.fallback2]
+        chain = [m for m in candidates if m.is_available()]
 
-        if not self.primary.is_open:
-            chain.append(self.primary)
-        elif self.primary.should_attempt_recovery():
-            chain.append(self.primary)  # recovery attempt
-        # else: skip primary entirely, go straight to fallbacks
-
-        if self.primary not in chain or self.primary.is_open:
-            chain.append(self.fallback1)
-            chain.append(self.fallback2)
-        else:
-            # primary is healthy and first in chain — still list fallbacks after it
-            chain.append(self.fallback1)
-            chain.append(self.fallback2)
-
-        # De-duplicate while preserving order
-        seen = set()
-        ordered = []
-        for m in chain:
-            if m.name not in seen:
-                ordered.append(m)
-                seen.add(m.name)
+        # Safeguard: if all circuits are open and none are due for recovery yet,
+        # fallback to primary to attempt recovery rather than returning empty list.
+        if not chain:
+            chain = [self.primary]
 
         if skip_tiers:
-            filtered = [m for m in ordered if m.name not in skip_tiers]
-            if filtered:  # never skip down to an empty chain
+            filtered = [m for m in chain if m.name not in skip_tiers]
+            if filtered:
                 return filtered
-        return ordered
+        return chain
 
     def status(self) -> dict:
         """For a /health or /status endpoint — shows current breaker state."""

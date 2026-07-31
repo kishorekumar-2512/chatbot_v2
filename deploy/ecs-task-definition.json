@@ -15,6 +15,7 @@
         { "containerPort": 8000, "protocol": "tcp" }
       ],
       "environment": [
+        { "name": "REQUIRE_AUTH", "value": "true" },
         { "name": "PRIMARY_LLM", "value": "groq" },
         { "name": "GROQ_MODEL", "value": "openai/gpt-oss-120b" },
         { "name": "GEMINI_MODEL", "value": "gemini-3.1-flash-lite" },
