@@ -38,7 +38,7 @@ BEGIN
             CREATE POLICY org_isolation_policy ON %I
             FOR ALL
             USING (
-                zecure_org_id = current_app_org_id()
+                zecure_org_id::text = current_app_org_id()
                 OR current_app_org_id() IS NULL
                 OR current_app_org_id() = ''''
             );
