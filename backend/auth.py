@@ -26,7 +26,9 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+# Defaults to "false" so local dev runs seamlessly without 401 errors.
+# Set REQUIRE_AUTH=true in production environment variables (ECS / Terraform).
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
 JWKS_URI     = os.getenv("JWKS_URI", "")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "")
 JWT_ISSUER   = os.getenv("JWT_ISSUER", "")
