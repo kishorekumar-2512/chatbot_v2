@@ -10,8 +10,15 @@ export async function getProviders() {
 /**
  * List configured API keys (masked).
  */
-export async function getKeys(customerId = 'default') {
-  return get(`/settings/keys?customer_id=${customerId}`);
+export async function getKeys(customerId = '') {
+  return get(`/settings/keys?customer_id=${encodeURIComponent(customerId)}`);
+}
+
+/**
+ * System + BYO LLM configuration status.
+ */
+export async function getLlmStatus(customerId = '') {
+  return get(`/settings/llm-status?customer_id=${encodeURIComponent(customerId)}`);
 }
 
 /**
@@ -31,13 +38,13 @@ export async function validateKey(data) {
 /**
  * Toggle a key enabled/disabled.
  */
-export async function toggleKey(provider, enabled, customerId = 'default') {
+export async function toggleKey(provider, enabled, customerId = '') {
   return patch('/settings/keys/toggle', { provider, enabled, customer_id: customerId });
 }
 
 /**
  * Delete a saved key.
  */
-export async function deleteKey(provider, customerId = 'default') {
+export async function deleteKey(provider, customerId = '') {
   return del(`/settings/keys/${provider}?customer_id=${customerId}`);
 }

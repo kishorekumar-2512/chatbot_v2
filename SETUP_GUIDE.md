@@ -62,9 +62,8 @@ GEMINI_API_KEY=AIzaSy_your_gemini_api_key_here
 
 # ── Optional Model Configs ──────────────────────────────────
 PRIMARY_LLM=groq
-GROQ_MODEL=llama-3.3-70b-versatile
-GEMINI_MODEL=gemini-2.0-flash
-OLLAMA_MODEL=qwen2.5-coder:7b
+# Model defaults and supported values are defined in backend/llm_registry.py.
+# Add a model override only when a deployment intentionally requires one.
 ```
 
 > [!IMPORTANT]

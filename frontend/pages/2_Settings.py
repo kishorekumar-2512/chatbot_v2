@@ -11,17 +11,22 @@ import requests
 import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+TENANT_ID = os.getenv("CUSTOMER_ID", "").strip()
 
 st.set_page_config(page_title="Settings · LLM Keys", page_icon="⚙️", layout="wide")
 
 st.title("⚙️ LLM Settings")
+if not TENANT_ID:
+    st.error("Set CUSTOMER_ID before managing tenant-scoped BYO API keys.")
+    st.stop()
+
 st.caption("Add your company's LLM API keys. When configured, your key is used instead of the default fallback chain.")
 
 # ── Info banner ───────────────────────────────────────────────────────────────
 st.info("""
 **How it works:**
 - If you add your own API key, it will be used for all queries (higher priority than defaults)
-- If no key is added, or if your key fails, the system falls back to: **Qwen (local) → Groq → Gemini**
+- If no key is added, or if your key fails, the system falls back to: **Groq → Gemini → Ollama (local)**
 - Keys are stored encrypted on the server
 - You can add multiple providers — the system will try them in priority order
 """)
@@ -45,7 +50,7 @@ st.divider()
 # ── Load providers and existing keys ──────────────────────────────────────────
 try:
     providers_resp = requests.get(f"{BACKEND_URL}/settings/providers", timeout=10)
-    keys_resp      = requests.get(f"{BACKEND_URL}/settings/keys", timeout=10)
+    keys_resp      = requests.get(f"{BACKEND_URL}/settings/keys", params={"customer_id": TENANT_ID}, timeout=10)
     providers      = providers_resp.json().get("providers", {}) if providers_resp.ok else {}
     saved_keys     = keys_resp.json().get("keys", {}) if keys_resp.ok else {}
 except Exception as e:
@@ -71,13 +76,13 @@ else:
             label = "Disable" if info["enabled"] else "Enable"
             if st.button(label, key=f"toggle_{provider_id}"):
                 r = requests.patch(f"{BACKEND_URL}/settings/keys/toggle",
-                    json={"provider": provider_id, "enabled": new_state})
+                    json={"provider": provider_id, "enabled": new_state, "customer_id": TENANT_ID})
                 if r.ok:
                     st.success(f"{'Enabled' if new_state else 'Disabled'} {info['provider_name']}")
                     st.rerun()
         with col4:
             if st.button("🗑️ Remove", key=f"del_{provider_id}"):
-                r = requests.delete(f"{BACKEND_URL}/settings/keys/{provider_id}")
+                r = requests.delete(f"{BACKEND_URL}/settings/keys/{provider_id}", params={"customer_id": TENANT_ID})
                 if r.ok:
                     st.success(f"Removed {info['provider_name']} key")
                     st.rerun()
@@ -144,7 +149,7 @@ with col_right:
                 with st.spinner("Testing..."):
                     r = requests.post(
                         f"{BACKEND_URL}/settings/keys/validate",
-                        json={"provider": provider, "api_key": api_key, "model": model},
+                        json={"provider": provider, "api_key": api_key, "model": model, "customer_id": TENANT_ID},
                         timeout=15,
                     )
                     if r.ok:
@@ -161,7 +166,7 @@ with col_right:
                 with st.spinner("Validating and saving..."):
                     r = requests.post(
                         f"{BACKEND_URL}/settings/keys",
-                        json={"provider": provider, "api_key": api_key, "model": model},
+                        json={"provider": provider, "api_key": api_key, "model": model, "customer_id": TENANT_ID},
                         timeout=15,
                     )
                     if r.ok:
@@ -181,23 +186,26 @@ try:
     if health.ok:
         d = health.json()
         cb = d.get("circuit_breaker", {})
+        llm = d.get("llm", {})
+        chain = llm.get("fallback_chain", ["groq", "gemini", "qwen"])
+        labels = {"groq": "Groq", "gemini": "Gemini", "qwen": "Ollama/Qwen"}
+        slots = ["primary", "fallback1", "fallback2"]
+        slot_labels = {"primary": "Primary", "fallback1": "Fallback 1", "fallback2": "Fallback 2"}
 
         col1, col2, col3 = st.columns(3)
-        with col1:
-            p = cb.get("primary", {})
-            icon = "🔴" if p.get("circuit_open") else "🟢"
-            st.metric("Qwen (Primary)", f"{icon} {'Open' if p.get('circuit_open') else 'OK'}",
-                      f"{p.get('consecutive_failures',0)} failures")
-        with col2:
-            f1 = cb.get("fallback1", {})
-            icon = "🔴" if f1.get("circuit_open") else "🟢"
-            st.metric("Groq (Fallback 1)", f"{icon} {'Open' if f1.get('circuit_open') else 'OK'}",
-                      f"{f1.get('consecutive_failures',0)} failures")
-        with col3:
-            f2 = cb.get("fallback2", {})
-            icon = "🔴" if f2.get("circuit_open") else "🟢"
-            st.metric("Gemini (Fallback 2)", f"{icon} {'Open' if f2.get('circuit_open') else 'OK'}",
-                      f"{f2.get('consecutive_failures',0)} failures")
+        for col, slot, tier_key in zip([col1, col2, col3], slots, chain):
+            tier = cb.get(slot, {})
+            icon = "🔴" if tier.get("circuit_open") else "🟢"
+            with col:
+                st.metric(
+                    f"{labels.get(tier_key, tier_key)} ({slot_labels[slot]})",
+                    f"{icon} {'Open' if tier.get('circuit_open') else 'OK'}",
+                    f"{tier.get('consecutive_failures', 0)} failures",
+                )
+
+        groq_ok = "✅ set" if llm.get("groq", {}).get("configured") else "❌ missing"
+        gemini_ok = "✅ set" if llm.get("gemini", {}).get("configured") else "❌ missing"
+        st.caption(f"Env keys: GROQ_API_KEY {groq_ok} · GEMINI_API_KEY {gemini_ok}")
 except Exception:
     st.caption("Could not fetch system status.")
 

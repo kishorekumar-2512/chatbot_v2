@@ -33,6 +33,7 @@ RUN mkdir -p /app/embeddings/chroma_store /app/data /app/reports
 ENV PYTHONUNBUFFERED=1 \
     CHROMA_DB_PATH=/app/embeddings/chroma_store \
     KEY_STORE_PATH=/app/data/llm_keys.json \
+    LLM_FAILURE_LOG_PATH=/app/data/llm_failures.jsonl \
     REPORTS_DIR=/app/reports
 
 EXPOSE 8000

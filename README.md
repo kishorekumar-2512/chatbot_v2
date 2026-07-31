@@ -92,6 +92,8 @@ GEMINI_API_KEY=your_gemini_key_here
 ```
 *(Note: Set `REQUIRE_AUTH=false` for local dev so authentication is bypassed. Set `true` in production with JWT JWKS).*
 
+LLM provider defaults and supported BYO models are defined in `backend/llm_registry.py`. Local `.env` LLM changes are detected for the next request; deployed environment or secret changes require a task restart. BYO credentials are tenant-scoped and never inherited from a shared default bucket.
+
 ### 3. Build the embedding index
 
 ```bash

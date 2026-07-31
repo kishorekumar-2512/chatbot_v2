@@ -12,7 +12,7 @@ export default function APIKeyCard({ keyData, onToggle, onDelete }) {
       <div className="key-card__header">
         <div className="key-card__provider">
           <span>{icon}</span>
-          <span>{provider}</span>
+          <span>{keyData.provider_name || provider}</span>
         </div>
         <div className="key-card__actions">
           <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', cursor: 'pointer', fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>

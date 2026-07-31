@@ -27,7 +27,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from backend.model_router import router as model_router
 from backend.confidence import calculate_confidence
 from backend.sql_validator import extract_sql, validate_sql, validate_org_security
 from backend.mcp_client import host as mcp_host
@@ -53,10 +52,11 @@ except ImportError:
     def get_schema_for_tables(*a, **kw): return ""
 
 from backend.llm_key_store import (
-    save_key, get_key, get_all_keys, delete_key, toggle_key,
-    validate_key, call_customer_llm, SUPPORTED_PROVIDERS,
-    analyze_image_with_gemini, analyze_dashboard_with_gemini,
+    save_key, get_all_keys, delete_key, toggle_key, key_store_status,
 )
+from backend.llm_orchestrator import AllProvidersFailed, orchestrator as llm_orchestrator
+from backend.llm_registry import PROVIDERS, provider_catalog
+from backend.llm_config import system_llm_status, format_all_models_failed_error
 from backend.self_correction import (
     build_retry_context, diagnose_zero_rows,
     sanity_check, generate_answer, check_sql_quality, try_auto_repair,
@@ -70,6 +70,10 @@ from backend.auth import get_current_user, AuthenticatedUser, REQUIRE_AUTH
 DATABASE_URL    = os.getenv("DATABASE_URL")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:8501")
 MAX_ATTEMPTS    = 3
+
+
+async def _generate_llm(prompt: str, tenant_id: str | None, max_tokens: int = 400) -> tuple[str, str]:
+    return await llm_orchestrator.generate(prompt, tenant_id=tenant_id, max_tokens=max_tokens)
 
 # ── DB pool for schema validator cache ────────────────────────────────────────
 _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
@@ -535,18 +539,6 @@ def is_followup_question(question: str) -> bool:
     return bool(_CONTINUATION_RE.search(question))
 
 
-def _error_signature(err: str) -> str:
-    """
-    Normalizes an error message so the SAME CLASS of mistake (e.g. "unknown
-    table: 'foo'" vs "unknown table: 'bar'") is recognized as a repeat, even
-    though the exact table/column name differs. Used to detect when the
-    local model is stuck making the same kind of error twice — at that
-    point another identical attempt is very unlikely to help; escalating to
-    a bigger fallback model is more likely to actually fix it.
-    """
-    return re.sub(r"'[^']*'", "'X'", err or "")[:60].lower()
-
-
 def build_conversation_context_block(context: "ConversationContext | None", question: str) -> str:
     """
     Returns a short prompt block resolving pronouns/continuations against
@@ -786,6 +778,9 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
     last_sql   = ""
     validation_errors: list[str] = []
 
+    async def generate_for_request(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
+        return await _generate_llm(prompt, org_id, max_tokens)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
 
         # Build the full prompt
@@ -834,10 +829,6 @@ Question: {question}
         # 3rd try on the same small local model is unlikely to help —
         # escalate straight to the bigger fallback model instead of wasting
         # another round-trip repeating the mistake.
-        skip_tiers = None
-        if len(failed_attempts) >= 2:
-            if _error_signature(failed_attempts[-1][1]) == _error_signature(failed_attempts[-2][1]):
-                skip_tiers = {"qwen"}
 
         # Try customer's own LLM key first (if configured)
         # NOTE: bumped from 500 -> 700 (1000 for complex questions). The
@@ -846,14 +837,10 @@ Question: {question}
         # block off mid-query — a real contributor to both the retries
         # (slowness) and the wrong-answer rate (accuracy) reported after
         # this was added.
-        customer_result = await call_customer_llm(prompt, customer_id=org_id or "default", max_tokens=gen_max_tokens)
-        if customer_result:
-            raw, model_used = customer_result
-        else:
-            try:
-                raw, model_used = await model_router.generate(prompt, max_tokens=gen_max_tokens, skip_tiers=skip_tiers)
-            except RuntimeError as e:
-                raise ValueError(f"All models failed: {e}")
+        try:
+            raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
+        except AllProvidersFailed as e:
+            raise ValueError(format_all_models_failed_error(e))
 
         # Strip <think> block before extracting SQL
         raw_no_think = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
@@ -910,7 +897,7 @@ Question: {question}
 
         # ── Zero-row diagnosis ───────────────────────────────────────────────
         if len(rows) == 0 and attempt < MAX_ATTEMPTS:
-            fixed_sql = await diagnose_zero_rows(sql, model_router.generate)
+            fixed_sql = await diagnose_zero_rows(sql, generate_for_request)
             if fixed_sql and fixed_sql != sql:
                 try:
                     fixed_rows = await mcp_host.run_query(fixed_sql)
@@ -923,7 +910,7 @@ Question: {question}
 
         # ── Richer, data-grounded answer + interactive follow-ups ────────────
         quick_stats = compute_quick_stats(rows)
-        answer = await generate_answer(question, rows, model_router.generate, quick_stats=quick_stats)
+        answer = await generate_answer(question, rows, generate_for_request, quick_stats=quick_stats)
         followups = generate_followups(question, rows, sql, qctx["intent"])
 
         # ── Store successful example for future retrieval ─────────────────────
@@ -981,7 +968,7 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     if image_base64:
         yield {"type": "status", "stage": "vision", "message": "👁️ Analyzing uploaded image using Vision Agent..."}
         try:
-            chart_descriptions = await analyze_dashboard_with_gemini(image_base64, customer_id=org_id or "default")
+            chart_descriptions = await llm_orchestrator.analyze_dashboard(image_base64, org_id)
             num_charts = len(chart_descriptions)
 
             if num_charts > 1:
@@ -1076,6 +1063,9 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     last_sql   = ""
     validation_errors: list[str] = []
 
+    async def generate_for_request(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
+        return await _generate_llm(prompt, org_id, max_tokens)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         retry_ctx = build_retry_context(failed_attempts)
 
@@ -1121,36 +1111,16 @@ Question: {question}
         # If the last two attempts failed with the SAME CLASS of error,
         # escalate straight to the bigger fallback model instead of another
         # local attempt that's likely to repeat the same mistake.
-        skip_tiers = None
-        if len(failed_attempts) >= 2:
-            if _error_signature(failed_attempts[-1][1]) == _error_signature(failed_attempts[-2][1]):
-                skip_tiers = {"qwen"}
-                yield {"type": "status", "stage": "escalate",
-                       "message": "🔺 Same error twice — escalating to a stronger fallback model..."}
 
         yield {"type": "status", "stage": "generating",
                "message": f"🧠 Generating SQL — attempt {attempt}/{MAX_ATTEMPTS}..."}
 
-        raw = ""
-        customer_result = await call_customer_llm(prompt, customer_id=org_id or "default", max_tokens=gen_max_tokens)
-        if customer_result:
-            raw, model_used = customer_result
+        try:
+            raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
             yield {"type": "thinking_token", "text": raw, "model": model_used}
-        else:
-            try:
-                async for chunk in model_router.generate_stream(prompt, max_tokens=gen_max_tokens, skip_tiers=skip_tiers):
-                    if "token" in chunk:
-                        raw += chunk["token"]
-                        yield {"type": "thinking_token", "text": chunk["token"], "model": chunk.get("model", "qwen")}
-                    elif chunk.get("model_failed"):
-                        yield {"type": "status", "stage": "fallback",
-                               "message": f"⚠️ {chunk['model_failed']} unavailable, switching model..."}
-                    elif chunk.get("done"):
-                        raw = chunk["full_text"]
-                        model_used = chunk["model"]
-            except RuntimeError as e:
-                yield {"type": "error", "message": f"All models failed: {e}"}
-                return
+        except AllProvidersFailed as e:
+            yield {"type": "error", "message": format_all_models_failed_error(e)}
+            return
 
         raw_no_think = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         sql = extract_sql(raw_no_think)
@@ -1205,7 +1175,7 @@ Question: {question}
         if len(rows) == 0 and attempt < MAX_ATTEMPTS:
             yield {"type": "status", "stage": "diagnosis",
                    "message": "🔎 Zero rows returned — diagnosing and trying a fix..."}
-            fixed_sql = await diagnose_zero_rows(sql, model_router.generate)
+            fixed_sql = await diagnose_zero_rows(sql, generate_for_request)
             if fixed_sql and fixed_sql != sql:
                 try:
                     fixed_rows = await mcp_host.run_query(fixed_sql)
@@ -1216,7 +1186,7 @@ Question: {question}
 
         yield {"type": "status", "stage": "answer", "message": "✍️ Writing the answer..."}
         quick_stats = compute_quick_stats(rows)
-        answer = await generate_answer(question, rows, model_router.generate, quick_stats=quick_stats)
+        answer = await generate_answer(question, rows, generate_for_request, quick_stats=quick_stats)
         followups = generate_followups(question, rows, sql, qctx["intent"])
         store_successful_example(question, sql, len(rows))
 
@@ -1311,50 +1281,96 @@ class ReportRequest(BaseModel):
     chart_json: Optional[str] = None
 
 
+def _settings_tenant(customer_id: str | None, user: AuthenticatedUser | None) -> str:
+    requested_tenant = (customer_id or "").strip() or "default"
+    if REQUIRE_AUTH:
+        if not user or not user.org_id:
+            raise HTTPException(403, "Authenticated users must have an organization ID")
+        if requested_tenant != "default" and requested_tenant != user.org_id:
+            raise HTTPException(403, "API keys can only be managed for your organization")
+        return user.org_id
+    if requested_tenant == "default":
+        raise HTTPException(400, "Select an organization before managing BYO API keys")
+    return requested_tenant
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 # ── LLM Key Management Routes ─────────────────────────────────────────────────
 
 @app.get("/settings/providers")
 def list_providers(user: AuthenticatedUser = Depends(get_current_user)):
     """List all supported LLM providers and their available models."""
-    return {"providers": SUPPORTED_PROVIDERS}
+    return {"providers": provider_catalog()}
 
 @app.get("/settings/keys")
 def list_keys(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
     """List all configured API keys for a customer (keys are masked)."""
-    return {"keys": get_all_keys(customer_id)}
+    tenant_id = _settings_tenant(customer_id, user)
+    return {"keys": get_all_keys(tenant_id)}
 
 @app.post("/settings/keys")
 async def add_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """Validate and save an API key for a provider."""
-    validation = await validate_key(req.provider, req.api_key, req.model)
+    req.provider = req.provider.strip().lower()
+    req.api_key = req.api_key.strip()
+    req.model = req.model.strip()
+    tenant_id = _settings_tenant(req.customer_id, user)
+    if req.provider not in PROVIDERS:
+        raise HTTPException(400, f"Unknown provider: {req.provider}")
+    if req.provider != "ollama" and not req.api_key:
+        raise HTTPException(400, "API key is required")
+    validation = await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
     if not validation["valid"]:
         raise HTTPException(400, f"Key validation failed: {validation.get('error', 'Unknown error')}")
-    result = save_key(req.provider, req.api_key, req.model, req.customer_id)
+    result = save_key(req.provider, req.api_key, req.model, tenant_id)
+    if not result.get("success"):
+        raise HTTPException(400, result.get("error", "Failed to save key"))
     return result
 
 @app.delete("/settings/keys/{provider}")
 def remove_key(provider: str, customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
     """Remove a saved API key."""
-    return delete_key(provider, customer_id)
+    return delete_key(provider, _settings_tenant(customer_id, user))
 
 @app.patch("/settings/keys/toggle")
 def toggle_provider(req: LLMKeyToggle, user: AuthenticatedUser = Depends(get_current_user)):
     """Enable or disable a provider without deleting the key."""
-    return toggle_key(req.provider, req.enabled, req.customer_id)
+    return toggle_key(req.provider, req.enabled, _settings_tenant(req.customer_id, user))
 
 @app.post("/settings/keys/validate")
 async def check_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """Test an API key without saving it."""
-    return await validate_key(req.provider, req.api_key, req.model)
+    req.provider = req.provider.strip().lower()
+    req.api_key = req.api_key.strip()
+    req.model = req.model.strip()
+    if req.provider not in PROVIDERS:
+        raise HTTPException(400, f"Unknown provider: {req.provider}")
+    if req.provider != "ollama" and not req.api_key:
+        return {"valid": False, "error": "API key is required"}
+    return await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
+
+
+@app.get("/settings/llm-status")
+def llm_status(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
+    """Report system env keys and BYO key configuration."""
+    tenant_id = _settings_tenant(customer_id, user)
+    byo = get_all_keys(tenant_id)
+    return {
+        "system": system_llm_status(),
+        "tenant_id": tenant_id,
+        "byo_keys": byo,
+        "byo_keys_configured": bool(byo),
+        "key_store": key_store_status(),
+    }
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "circuit_breaker": model_router.status(),
+        "circuit_breaker": llm_orchestrator.status(None),
         "embedding_index_ready": is_index_ready(),
+        "llm": system_llm_status(),
     }
 
 
@@ -1367,8 +1383,8 @@ def schema(user: AuthenticatedUser = Depends(get_current_user)):
 
 
 @app.get("/circuit-status")
-def circuit_status():
-    return model_router.status()
+def circuit_status(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
+    return llm_orchestrator.status(_settings_tenant(customer_id, user))
 
 
 @app.get("/dashboard/stats")

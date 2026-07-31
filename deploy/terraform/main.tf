@@ -271,8 +271,6 @@ resource "aws_ecs_task_definition" "backend" {
     environment = [
       { name = "REQUIRE_AUTH", value = "true" },
       { name = "PRIMARY_LLM", value = "groq" },
-      { name = "GROQ_MODEL", value = "openai/gpt-oss-120b" },
-      { name = "GEMINI_MODEL", value = "gemini-3.1-flash-lite" },
       { name = "RETRIEVAL_TOP_K", value = "8" },
       { name = "REINDEX_INTERVAL_HOURS", value = "24" },
       { name = "CHROMA_DB_PATH", value = "/app/embeddings/chroma_store" },

@@ -12,9 +12,9 @@ export const INTENT_ICONS = {
 
 /* ── Model labels ── */
 export const MODEL_LABELS = {
-  qwen: { label: 'Qwen 2.5 Coder', color: '#10B981', icon: '🟢' },
-  groq: { label: 'Groq · Llama 3.3 70B', color: '#F59E0B', icon: '🟡' },
-  gemini: { label: 'Gemini 2.0 Flash', color: '#EF4444', icon: '🔴' },
+  qwen: { label: 'Qwen 2.5 Coder (Ollama)', color: '#10B981', icon: '🟢' },
+  groq: { label: 'Groq', color: '#F59E0B', icon: '🟡' },
+  gemini: { label: 'Gemini', color: '#EF4444', icon: '🔴' },
 };
 
 /* ── Provider info for settings ── */

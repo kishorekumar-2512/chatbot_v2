@@ -1,430 +1,293 @@
-"""
-backend/llm_key_store.py
+"""Locked persistence for tenant-scoped BYO LLM credentials."""
 
-Manages customer-provided LLM API keys.
-Keys are stored encrypted in a local JSON file (or DB in production).
-Priority order when a question comes in:
-  1. Customer's own key (if set and valid)
-  2. Existing circuit-breaker chain (Qwen → Groq → Gemini)
-"""
+from __future__ import annotations
 
-import os
-import json
 import base64
 import hashlib
-import httpx
-from typing import Optional
+import json
+import os
+import tempfile
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-KEY_STORE_PATH = os.getenv("KEY_STORE_PATH", "./data/llm_keys.json")
-_SALT = "zecure_llm_salt_v1"   # in production, use a proper secret
+from filelock import FileLock
 
-SUPPORTED_PROVIDERS = {
-    "openai":    {"name": "OpenAI",            "models": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],               "url": "https://api.openai.com/v1/chat/completions"},
-    "anthropic": {"name": "Anthropic (Claude)", "models": ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"], "url": "https://api.anthropic.com/v1/messages"},
-    "deepseek":  {"name": "DeepSeek",          "models": ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"],  "url": "https://api.deepseek.com/chat/completions"},
-    "groq":      {"name": "Groq",              "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "deepseek-r1-distill-llama-70b"], "url": "https://api.groq.com/openai/v1/chat/completions"},
-    "gemini":    {"name": "Google Gemini",     "models": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"], "url": "https://generativelanguage.googleapis.com/v1beta/models"},
-    "ollama":    {"name": "Ollama (Local)",    "models": ["qwen2.5-coder:7b", "llama3.2", "qwen2.5:7b"],            "url": "http://localhost:11434"},
-}
+from backend.llm_config import runtime_config
+from backend.llm_registry import PROVIDERS
+
+
+_SALT = "zecure_llm_salt_v1"
+@dataclass(frozen=True)
+class StoredCredential:
+    tenant_id: str
+    provider: str
+    credential_id: str
+    version: int
+    api_key: str
+    model: str
+    enabled: bool
+
+    @property
+    def key_reference(self) -> str:
+        return f"byo:{self.tenant_id}:{self.provider}:{self.credential_id}:v{self.version}"
 
 
 def _simple_encrypt(text: str) -> str:
-    """Lightweight obfuscation — NOT production-grade encryption."""
     key = hashlib.sha256(_SALT.encode()).digest()
     data = text.encode()
-    encrypted = bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
+    encrypted = bytes([data[index] ^ key[index % len(key)] for index in range(len(data))])
     return base64.b64encode(encrypted).decode()
 
 
 def _simple_decrypt(token: str) -> str:
     key = hashlib.sha256(_SALT.encode()).digest()
     data = base64.b64decode(token.encode())
-    return bytes([data[i] ^ key[i % len(key)] for i in range(len(data))]).decode()
+    return bytes([data[index] ^ key[index % len(key)] for index in range(len(data))]).decode()
+
+
+def _store_path() -> Path:
+    return runtime_config.snapshot().key_store_path
+
+
+def _lock_path(path: Path) -> str:
+    return str(path.with_suffix(path.suffix + ".lock"))
+
+
+def _empty_store() -> dict:
+    return {"schema_version": 2, "tenants": {}, "legacy_unassigned": {}}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _upgrade_entry(provider: str, entry: dict) -> tuple[dict, bool]:
+    upgraded = dict(entry)
+    changed = False
+    if not upgraded.get("credential_id"):
+        upgraded["credential_id"] = uuid.uuid4().hex
+        changed = True
+    if not isinstance(upgraded.get("version"), int):
+        upgraded["version"] = 1
+        changed = True
+    if not upgraded.get("model"):
+        upgraded["model"] = PROVIDERS[provider].default_model
+        changed = True
+    if "enabled" not in upgraded:
+        upgraded["enabled"] = True
+        changed = True
+    if not upgraded.get("provider"):
+        upgraded["provider"] = provider
+        changed = True
+    if not upgraded.get("updated_at"):
+        upgraded["updated_at"] = _utc_now()
+        changed = True
+    return upgraded, changed
+
+
+def _normalize_store(raw: object) -> tuple[dict, bool]:
+    if not isinstance(raw, dict):
+        return _empty_store(), True
+    if raw.get("schema_version") == 2:
+        store = _empty_store()
+        store["tenants"] = raw.get("tenants", {}) if isinstance(raw.get("tenants"), dict) else {}
+        store["legacy_unassigned"] = raw.get("legacy_unassigned", {}) if isinstance(raw.get("legacy_unassigned"), dict) else {}
+        changed = False
+        for bucket in (store["tenants"], store["legacy_unassigned"]):
+            for tenant_id, entries in list(bucket.items()):
+                if not isinstance(entries, dict):
+                    bucket[tenant_id] = {}
+                    changed = True
+                    continue
+                for provider, entry in list(entries.items()):
+                    if provider not in PROVIDERS or not isinstance(entry, dict):
+                        entries.pop(provider, None)
+                        changed = True
+                        continue
+                    entries[provider], entry_changed = _upgrade_entry(provider, entry)
+                    changed = changed or entry_changed
+        return store, changed
+
+    store = _empty_store()
+    changed = True
+    for tenant_id, entries in raw.items():
+        if not isinstance(entries, dict):
+            continue
+        destination = store["legacy_unassigned"] if tenant_id == "default" else store["tenants"]
+        destination[tenant_id] = {}
+        for provider, entry in entries.items():
+            if provider not in PROVIDERS or not isinstance(entry, dict):
+                continue
+            destination[tenant_id][provider], _ = _upgrade_entry(provider, entry)
+    return store, changed
+
+
+def _read_store_unlocked(path: Path) -> tuple[dict, bool]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return _empty_store(), False
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"LLM key store is invalid JSON: {path}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read LLM key store: {path}") from exc
+    return _normalize_store(raw)
+
+
+def _write_store_unlocked(path: Path, store: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False)
+    try:
+        with handle:
+            json.dump(store, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        Path(handle.name).replace(path)
+    finally:
+        if os.path.exists(handle.name):
+            os.unlink(handle.name)
 
 
 def _load_store() -> dict:
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(_lock_path(path), timeout=10):
+        store, changed = _read_store_unlocked(path)
+        if changed:
+            _write_store_unlocked(path, store)
+        return store
+
+
+def _mutate_store(mutator) -> object:
+    path = _store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(_lock_path(path), timeout=10):
+        store, _ = _read_store_unlocked(path)
+        result = mutator(store)
+        _write_store_unlocked(path, store)
+        return result
+
+
+def _normalize_tenant_id(customer_id: Optional[str]) -> str:
+    return (customer_id or "").strip() or "default"
+
+
+def _masked_preview(entry: dict) -> str:
     try:
-        with open(KEY_STORE_PATH, "r") as f:
-            return json.load(f)
+        key = _simple_decrypt(entry["encrypted_key"])
     except Exception:
-        return {}
-
-
-def _save_store(store: dict):
-    Path(KEY_STORE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with open(KEY_STORE_PATH, "w") as f:
-        json.dump(store, f, indent=2)
+        return "****"
+    return key[:6] + "..." + key[-4:] if len(key) > 10 else "****"
 
 
 def save_key(provider: str, api_key: str, model: str = "", customer_id: str = "default") -> dict:
-    """Save a customer's API key for a provider."""
-    if provider not in SUPPORTED_PROVIDERS:
+    provider = provider.strip().lower()
+    if provider not in PROVIDERS:
         return {"success": False, "error": f"Unknown provider: {provider}"}
-    if not model or not model.strip():
-        model = SUPPORTED_PROVIDERS[provider]["models"][0]
+    api_key = (api_key or "").strip()
+    if provider == "ollama" and not api_key:
+        api_key = PROVIDERS[provider].endpoint
+    if not api_key:
+        return {"success": False, "error": "API key cannot be empty"}
+    model = (model or "").strip() or PROVIDERS[provider].default_model
+    tenant_id = _normalize_tenant_id(customer_id)
+
+    def save(store: dict) -> dict:
+        entries = store["tenants"].setdefault(tenant_id, {})
+        previous = entries.get(provider, {})
+        entries[provider] = {
+            "credential_id": previous.get("credential_id", uuid.uuid4().hex),
+            "version": int(previous.get("version", 0)) + 1,
+            "encrypted_key": _simple_encrypt(api_key),
+            "model": model,
+            "provider": provider,
+            "enabled": True,
+            "updated_at": _utc_now(),
+        }
+        return {"success": True, "provider": provider, "model": model, "tenant_id": tenant_id}
+
+    return _mutate_store(save)
+
+
+def get_active_credentials(customer_id: str) -> list[StoredCredential]:
+    tenant_id = _normalize_tenant_id(customer_id)
+    if tenant_id == "default":
+        return []
     store = _load_store()
-    if customer_id not in store:
-        store[customer_id] = {}
-    store[customer_id][provider] = {
-        "encrypted_key": _simple_encrypt(api_key),
-        "model": model,
-        "provider": provider,
-        "enabled": True,
-    }
-    _save_store(store)
-    return {"success": True, "provider": provider, "model": model}
-
-
-def get_key(provider: str, customer_id: str = "default") -> Optional[str]:
-    """Retrieve a decrypted API key for a provider."""
-    store = _load_store()
-    entry = store.get(customer_id, {}).get(provider)
-    if not entry or not entry.get("enabled"):
-        return None
-    try:
-        return _simple_decrypt(entry["encrypted_key"])
-    except Exception:
-        return None
-
-
-def get_model(provider: str, customer_id: str = "default") -> Optional[str]:
-    store = _load_store()
-    entry = store.get(customer_id, {}).get(provider)
-    if not entry:
-        return None
-    model = entry.get("model")
-    if not model or not model.strip():
-        model = SUPPORTED_PROVIDERS.get(provider, {}).get("models", [""])[0]
-    return model
+    credentials: list[StoredCredential] = []
+    for provider, entry in store["tenants"].get(tenant_id, {}).items():
+        if provider not in PROVIDERS or not entry.get("enabled"):
+            continue
+        try:
+            secret = _simple_decrypt(entry["encrypted_key"])
+        except Exception:
+            continue
+        credentials.append(StoredCredential(
+            tenant_id=tenant_id,
+            provider=provider,
+            credential_id=entry["credential_id"],
+            version=entry["version"],
+            api_key=secret,
+            model=entry.get("model") or PROVIDERS[provider].default_model,
+            enabled=True,
+        ))
+    return credentials
 
 
 def get_all_keys(customer_id: str = "default") -> dict:
-    """Return all configured providers for a customer (keys masked)."""
+    tenant_id = _normalize_tenant_id(customer_id)
     store = _load_store()
     result = {}
-    for provider, entry in store.get(customer_id, {}).items():
-        key = ""
-        try:
-            k = _simple_decrypt(entry["encrypted_key"])
-            key = k[:6] + "..." + k[-4:] if len(k) > 10 else "****"
-        except Exception:
-            key = "****"
+    for provider, entry in store["tenants"].get(tenant_id, {}).items():
+        if provider not in PROVIDERS:
+            continue
         result[provider] = {
             "provider": provider,
-            "provider_name": SUPPORTED_PROVIDERS.get(provider, {}).get("name", provider),
-            "model": entry.get("model", SUPPORTED_PROVIDERS.get(provider, {}).get("models", [""])[0]),
-            "enabled": entry.get("enabled", True),
-            "key_preview": key,
+            "provider_name": PROVIDERS[provider].display_name,
+            "model": entry.get("model") or PROVIDERS[provider].default_model,
+            "enabled": bool(entry.get("enabled")),
+            "key_preview": _masked_preview(entry),
         }
     return result
 
 
 def delete_key(provider: str, customer_id: str = "default") -> dict:
-    store = _load_store()
-    if customer_id in store and provider in store[customer_id]:
-        del store[customer_id][provider]
-        _save_store(store)
+    tenant_id = _normalize_tenant_id(customer_id)
+
+    def delete(store: dict) -> dict:
+        entries = store["tenants"].get(tenant_id, {})
+        if provider not in entries:
+            return {"success": False, "error": "Key not found"}
+        del entries[provider]
+        if not entries:
+            store["tenants"].pop(tenant_id, None)
         return {"success": True}
-    return {"success": False, "error": "Key not found"}
+
+    return _mutate_store(delete)
 
 
 def toggle_key(provider: str, enabled: bool, customer_id: str = "default") -> dict:
-    store = _load_store()
-    if customer_id in store and provider in store[customer_id]:
-        store[customer_id][provider]["enabled"] = enabled
-        _save_store(store)
+    tenant_id = _normalize_tenant_id(customer_id)
+
+    def toggle(store: dict) -> dict:
+        entry = store["tenants"].get(tenant_id, {}).get(provider)
+        if not entry:
+            return {"success": False, "error": "Key not found"}
+        entry["enabled"] = bool(enabled)
+        entry["version"] = int(entry.get("version", 0)) + 1
+        entry["updated_at"] = _utc_now()
         return {"success": True}
-    return {"success": False, "error": "Key not found"}
+
+    return _mutate_store(toggle)
 
 
-async def validate_key(provider: str, api_key: str, model: str = "") -> dict:
-    """
-    Test an API key with a minimal request before saving.
-    Returns {"valid": bool, "error": str|None}
-    """
-    if not model or not model.strip():
-        if provider in SUPPORTED_PROVIDERS:
-            model = SUPPORTED_PROVIDERS[provider]["models"][0]
-        else:
-            model = ""
-    test_prompt = "Reply with the single word: OK"
-    try:
-        if provider == "openai":
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(
-                    SUPPORTED_PROVIDERS["openai"]["url"],
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"model": model, "messages": [{"role": "user", "content": test_prompt}], "max_tokens": 5},
-                )
-                r.raise_for_status()
-                return {"valid": True}
-
-        elif provider == "anthropic":
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(
-                    SUPPORTED_PROVIDERS["anthropic"]["url"],
-                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                    json={"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": test_prompt}]},
-                )
-                r.raise_for_status()
-                return {"valid": True}
-
-        elif provider in ("groq", "deepseek"):
-            # OpenAI-compatible chat completions endpoint — same request shape as openai
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(
-                    SUPPORTED_PROVIDERS[provider]["url"],
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"model": model, "messages": [{"role": "user", "content": test_prompt}], "max_tokens": 5},
-                )
-                r.raise_for_status()
-                return {"valid": True}
-
-        elif provider == "gemini":
-            url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={api_key}"
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.post(url, json={"contents": [{"parts": [{"text": test_prompt}]}]})
-                r.raise_for_status()
-                return {"valid": True}
-
-        elif provider == "ollama":
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"{SUPPORTED_PROVIDERS['ollama']['url']}/api/tags")
-                models = [m["name"] for m in r.json().get("models", [])]
-                if model not in models:
-                    return {"valid": False, "error": f"Model '{model}' not found. Run: ollama pull {model}"}
-                return {"valid": True}
-
-    except httpx.HTTPStatusError as e:
-        return {"valid": False, "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
-    except Exception as e:
-        return {"valid": False, "error": str(e)}
-
-    return {"valid": False, "error": "Unknown provider"}
-
-
-async def call_customer_llm(prompt: str, customer_id: str = "default", max_tokens: int = 500) -> Optional[tuple[str, str]]:
-    """
-    Try the customer's own LLM keys in priority order.
-    Returns (response_text, model_label) or None if no customer keys configured.
-    Priority: openai → anthropic → groq → gemini → ollama
-
-    Looks up keys under `customer_id` first; if nothing found, falls back to
-    the "default" bucket so BYO keys saved from the Settings UI always work.
-    """
-    import logging
-    logger = logging.getLogger("uvicorn.error")
-
-    priority = ["openai", "anthropic", "deepseek", "groq", "gemini", "ollama"]
+def key_store_status() -> dict:
     store = _load_store()
-
-    # Try org-specific keys first, then fall back to "default"
-    buckets_to_try = [customer_id]
-    if customer_id != "default":
-        buckets_to_try.append("default")
-
-    logger.info(f"[BYO] call_customer_llm called with customer_id='{customer_id}', buckets={buckets_to_try}")
-    logger.info(f"[BYO] Store has keys for: {list(store.keys())}")
-
-    for bucket in buckets_to_try:
-        customer_keys = store.get(bucket, {})
-        if not customer_keys:
-            logger.info(f"[LLM Routing] Bucket '{bucket}' empty — checking next bucket...")
-            continue
-        logger.info(f"[LLM Routing] Found configured BYO providers for '{bucket}': {list(customer_keys.keys())}")
-        for provider in priority:
-            if provider not in customer_keys:
-                continue
-            entry = customer_keys[provider]
-            if not entry.get("enabled"):
-                logger.info(f"[LLM Routing] BYO key for provider '{provider}' is disabled — skipping")
-                continue
-            try:
-                key   = _simple_decrypt(entry["encrypted_key"])
-                model = entry.get("model", "")
-                logger.info(f"[LLM Routing] 🔑 Using BYO API key for provider '{provider}' (model: '{model}')")
-                text  = await _call_provider(provider, key, model, prompt, max_tokens)
-                if text:
-                    logger.info(f"[LLM Routing] ✅ BYO Provider '{provider}' ({model}) successfully returned response ({len(text)} chars)")
-                    return text, f"{SUPPORTED_PROVIDERS[provider]['name']} ({model})"
-                else:
-                    logger.warning(f"[LLM Routing] BYO Provider '{provider}' returned empty response")
-            except Exception as e:
-                logger.warning(f"[LLM Routing] ❌ BYO Provider '{provider}' execution failed: {type(e).__name__}: {e}")
-                continue
-    logger.info(f"[LLM Routing] No active BYO key available for customer '{customer_id}' — falling back to system circuit breaker chain (Groq -> Gemini -> Qwen)")
-    return None
-
-
-async def _call_provider(provider: str, api_key: str, model: str, prompt: str, max_tokens: int) -> Optional[str]:
-    import logging
-    import asyncio
-    logger = logging.getLogger("uvicorn.error")
-
-    # Generous timeouts: 30s connect, 120s read for cloud APIs
-    cloud_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-
-    for attempt in range(1, 4):
-        try:
-            transport = httpx.AsyncHTTPTransport(retries=2)
-            if provider in ("openai", "groq", "deepseek"):
-                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-                    r = await c.post(
-                        SUPPORTED_PROVIDERS[provider]["url"],
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
-                    )
-                    r.raise_for_status()
-                    return r.json()["choices"][0]["message"]["content"].strip()
-
-            elif provider == "anthropic":
-                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-                    r = await c.post(
-                        SUPPORTED_PROVIDERS["anthropic"]["url"],
-                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                        json={"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
-                    )
-                    r.raise_for_status()
-                    return r.json()["content"][0]["text"].strip()
-
-            elif provider == "gemini":
-                url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={api_key}"
-                async with httpx.AsyncClient(timeout=cloud_timeout, transport=transport) as c:
-                    r = await c.post(url, json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
-                    })
-                    r.raise_for_status()
-                    return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-            elif provider == "ollama":
-                async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)) as c:
-                    r = await c.post(
-                        f"{SUPPORTED_PROVIDERS['ollama']['url']}/api/generate",
-                        json={"model": model, "prompt": prompt, "stream": False,
-                              "options": {"num_predict": max_tokens, "temperature": 0.1}},
-                    )
-                    r.raise_for_status()
-                    return r.json()["response"].strip()
-        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectError, httpx.PoolTimeout) as net_err:
-            logger.warning(f"[BYO] Network error on attempt {attempt}/3 for {provider}: {net_err}")
-            if attempt < 3:
-                await asyncio.sleep(1.0 * attempt)
-                continue
-            raise net_err
-        except Exception as e:
-            raise e
-
-    return None
-
-
-async def analyze_image_with_gemini(image_b64: str, prompt: str, customer_id: str = "default") -> str:
-    """
-    Dedicated Vision Agent function using Gemini (since it has native multimodal support).
-    First tries the user's custom Gemini key. If not set/fails, falls back to the .env GEMINI_API_KEY.
-    """
-    key = get_key("gemini", customer_id)
-    if not key:
-        key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        raise ValueError("No Gemini API key available for Vision analysis. Please add a Gemini key in Settings or in your .env file.")
-
-    # Strip the data:image/png;base64, prefix if present
-    if "," in image_b64:
-        mime_type = image_b64.split(";")[0].split(":")[1]
-        base64_data = image_b64.split(",")[1]
-    else:
-        mime_type = "image/jpeg"
-        base64_data = image_b64
-
-    # The new recommended default for multimodal
-    model = get_model("gemini", customer_id) or "gemini-3.1-pro" 
-    url = f"{SUPPORTED_PROVIDERS['gemini']['url']}/{model}:generateContent?key={key}"
-
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inlineData": {"mimeType": mime_type, "data": base64_data}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.1}
+    return {
+        "legacy_default_keys_quarantined": len(store["legacy_unassigned"].get("default", {})),
+        "tenant_count": len(store["tenants"]),
     }
-
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(url, json=payload)
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-
-async def analyze_dashboard_with_gemini(image_b64: str, customer_id: str = "default") -> list[dict]:
-    """
-    Multi-chart Vision Agent: identifies every distinct chart/visualization in a
-    dashboard screenshot and returns a list of structured descriptions.
-
-    Returns a list of dicts, each with keys:
-      - chart_number (int)
-      - chart_type (str)  e.g. "pie chart", "bar chart", "line chart"
-      - description (str) natural-language data requirements for that chart
-
-    If only one chart is detected, the list has a single element (so the caller
-    can fall back to the normal single-query path with zero behaviour change).
-    """
-    DASHBOARD_PROMPT = (
-        "Analyze this image carefully. Count how many distinct charts or "
-        "visualizations are present.\n\n"
-        "For EACH chart, output a block in EXACTLY this format:\n"
-        "--- CHART N ---\n"
-        "Type: <chart type, e.g. pie chart, bar chart, line chart, donut chart>\n"
-        "Data: <the metrics, groupings, and filters required as a database query "
-        "requirement in plain English>\n\n"
-        "Number the charts starting from 1. Be brief — list only the data "
-        "requirements, not styling details. If there is only ONE chart, still "
-        "use the same format with CHART 1."
-    )
-
-    raw = await analyze_image_with_gemini(image_b64, DASHBOARD_PROMPT, customer_id)
-    return _parse_dashboard_response(raw)
-
-
-def _parse_dashboard_response(raw: str) -> list[dict]:
-    """Parse the structured Vision Agent output into a list of chart dicts."""
-    import re
-    blocks = re.split(r"---\s*CHART\s+(\d+)\s*---", raw, flags=re.IGNORECASE)
-    # blocks alternates: [preamble, "1", body1, "2", body2, ...]
-    charts: list[dict] = []
-    i = 1
-    while i < len(blocks) - 1:
-        num = int(blocks[i])
-        body = blocks[i + 1].strip()
-
-        chart_type = ""
-        description = ""
-        for line in body.splitlines():
-            line_s = line.strip()
-            if line_s.lower().startswith("type:"):
-                chart_type = line_s[5:].strip()
-            elif line_s.lower().startswith("data:"):
-                description = line_s[5:].strip()
-
-        # If the description spans multiple lines after "Data:", grab them
-        if not description:
-            description = body
-
-        charts.append({
-            "chart_number": num,
-            "chart_type": chart_type,
-            "description": description,
-        })
-        i += 2
-
-    # Fallback: if parsing failed, treat the entire response as a single chart
-    if not charts:
-        charts.append({
-            "chart_number": 1,
-            "chart_type": "",
-            "description": raw,
-        })
-
-    return charts
