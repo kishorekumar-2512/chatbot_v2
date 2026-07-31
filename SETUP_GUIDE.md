@@ -91,7 +91,11 @@ python -m embeddings.build_index
 
 If your database hosts multi-tenant data with a `zecure_org_id` column:
 ```bash
-psql -d your_db_name -f migrations/001_enable_rls.sql
+# Option A: Pass your DATABASE_URL directly:
+psql "$DATABASE_URL" -f migrations/001_enable_rls.sql
+
+# Option B: Pass host, user, and your actual database name:
+psql -h localhost -U postgres -d your_actual_db_name -f migrations/001_enable_rls.sql
 ```
 
 ---

@@ -102,7 +102,11 @@ python -m embeddings.build_index
 ### 4. Enable Database Row-Level Security (Optional)
 
 ```bash
-psql -d your_database -f migrations/001_enable_rls.sql
+# Using your DATABASE_URL from .env:
+psql "$DATABASE_URL" -f migrations/001_enable_rls.sql
+
+# Or using explicit flags (replace postgres and your_db_name with your actual values):
+psql -h localhost -U postgres -d your_db_name -f migrations/001_enable_rls.sql
 ```
 
 ### 5. Start the application
