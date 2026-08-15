@@ -136,7 +136,11 @@ def system_llm_status() -> dict:
 
 def format_all_models_failed_error(last_error: Optional[Exception | str] = None) -> str:
     status = system_llm_status()
-    message = "No LLM could answer this query. Configure a tenant BYO key or a system provider."
+    error_text = str(last_error or "").lower()
+    if "rate_limit" in error_text:
+        message = "The available LLM providers are temporarily rate-limited. Please wait a minute and try again."
+    else:
+        message = "No LLM could answer this query. Configure a tenant BYO key or a system provider."
     if last_error:
         message += f" Last error: {str(last_error).strip()}"
     return message + f" System chain: {' -> '.join(status['fallback_chain'])}."

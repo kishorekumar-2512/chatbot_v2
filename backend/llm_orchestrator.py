@@ -50,11 +50,12 @@ class ResolvedCredential:
 
 
 class ProviderCallError(RuntimeError):
-    def __init__(self, error_type: str, *, status_code: int | None = None, retry_after: float | None = None):
+    def __init__(self, error_type: str, *, status_code: int | None = None, retry_after: float | None = None, response_text: str | None = None):
         self.error_type = error_type
         self.status_code = status_code
         self.retry_after = retry_after
-        detail = f" ({status_code})" if status_code else ""
+        self.response_text = response_text
+        detail = f" ({status_code}): {response_text}" if status_code and response_text else f" ({status_code})" if status_code else ""
         super().__init__(f"{error_type}{detail}")
 
 
@@ -73,6 +74,8 @@ class BreakerState:
 class CredentialBreakerStore:
     """Process-local breaker state isolated by tenant, source, provider, and key version."""
 
+    _AUTH_COOLDOWN = 60  # seconds before retrying after auth/request errors
+
     def __init__(self, threshold: int = 3, recovery_seconds: int = 300) -> None:
         self._threshold = threshold
         self._recovery_seconds = recovery_seconds
@@ -84,9 +87,16 @@ class CredentialBreakerStore:
             state = self._states.get(identity.breaker_key)
             if not state:
                 return True
-            if state.blocked:
+            now = time.monotonic()
+            if state.open_until > now:
                 return False
-            return time.monotonic() >= state.open_until
+
+            # A cooldown has elapsed.  Clear its state before allowing the
+            # next request so the provider is both retried and accurately
+            # reported as recovered.
+            if state.blocked or state.open_until:
+                self._states.pop(identity.breaker_key, None)
+            return True
 
     def record_success(self, identity: CredentialIdentity) -> None:
         with self._lock:
@@ -97,7 +107,14 @@ class CredentialBreakerStore:
             state = self._states.setdefault(identity.breaker_key, BreakerState())
             state.last_error_type = error.error_type
             if error.error_type in {"auth", "request", "malformed_response"}:
+                # Timed cooldown instead of permanent block — auto-recovers
+                # after key rotation without needing a server restart
                 state.blocked = True
+                state.open_until = time.monotonic() + self._AUTH_COOLDOWN
+                return state
+            if error.error_type == "rate_limit":
+                cooldown = error.retry_after or self._recovery_seconds
+                state.open_until = max(state.open_until, time.monotonic() + max(5.0, cooldown))
                 return state
             state.consecutive_failures += 1
             if state.consecutive_failures >= self._threshold:
@@ -105,21 +122,32 @@ class CredentialBreakerStore:
                 state.open_until = time.monotonic() + max(1.0, cooldown)
             return state
 
-    def status(self, tenant_id: str) -> dict:
+    def reset_tenant_provider(self, tenant_id: str, provider: str) -> None:
+        with self._lock:
+            keys_to_delete = [
+                key for key in self._states.keys()
+                if key[0] == tenant_id and key[2] == provider
+            ]
+            for key in keys_to_delete:
+                del self._states[key]
+
+    def status(self, tenant_id: str | None) -> dict:
         now = time.monotonic()
         with self._lock:
             entries = {}
             for key, state in self._states.items():
                 tenant, source, provider, key_reference = key
-                if tenant != tenant_id:
+                if tenant_id and tenant != tenant_id:
                     continue
+                seconds_until_recovery = max(0, round(state.open_until - now, 1))
                 entries[f"{source}:{provider}:{key_reference}"] = {
+                    "tenant": tenant,
                     "source": source,
                     "provider": provider,
                     "key_reference": key_reference,
-                    "blocked": state.blocked,
+                    "blocked": state.blocked and seconds_until_recovery > 0,
                     "consecutive_failures": state.consecutive_failures,
-                    "seconds_until_recovery": max(0, round(state.open_until - now, 1)),
+                    "seconds_until_recovery": seconds_until_recovery,
                     "last_error_type": state.last_error_type,
                 }
             return entries
@@ -130,13 +158,15 @@ class RetryPolicy:
 
     @staticmethod
     def should_retry(error: ProviderCallError, attempt: int) -> bool:
-        return attempt < RetryPolicy.max_attempts and error.error_type in {"network", "timeout", "rate_limit", "service"}
+        if error.error_type in {"timeout", "network", "rate_limit"}:
+            return False  # Instant failover to next model in fallback chain — 0 retries
+        return attempt < RetryPolicy.max_attempts and error.error_type == "service"
 
     @staticmethod
     def delay_seconds(error: ProviderCallError, attempt: int) -> float:
         if error.retry_after is not None:
-            return min(max(error.retry_after, 0.0), 60.0)
-        return min(8.0, (2 ** (attempt - 1)) + random.uniform(0, 0.25))
+            return min(max(error.retry_after, 0.0), 2.0)
+        return min(2.0, (2 ** (attempt - 1)) + random.uniform(0, 0.25))
 
 
 class PersistentFailureLog:
@@ -177,9 +207,9 @@ class ProviderGateway:
     @staticmethod
     def _timeout_for(style: str, has_image: bool) -> httpx.Timeout:
         if style == "ollama":
-            return httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=30.0)
+            return httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
         read_timeout = 120.0 if has_image else 60.0
-        return httpx.Timeout(connect=30.0, read=read_timeout, write=30.0, pool=30.0)
+        return httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=30.0)
 
     async def _request(
         self,
@@ -234,7 +264,8 @@ class ProviderGateway:
             elif style == "ollama":
                 text = data["response"]
             else:
-                text = data["choices"][0]["message"]["content"]
+                msg = data["choices"][0]["message"]
+                text = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("empty response")
             return text.strip()
@@ -245,19 +276,20 @@ class ProviderGateway:
     def _http_error(response: httpx.Response) -> ProviderCallError:
         status = response.status_code
         retry_after = None
+        text_snippet = response.text[:120].strip() if response.text else ""
         if status == 429:
             try:
                 retry_after = float(response.headers.get("Retry-After", ""))
             except ValueError:
                 retry_after = None
-            return ProviderCallError("rate_limit", status_code=status, retry_after=retry_after)
+            return ProviderCallError("rate_limit", status_code=status, retry_after=retry_after, response_text=text_snippet)
         if status in {401, 403}:
-            return ProviderCallError("auth", status_code=status)
+            return ProviderCallError("auth", status_code=status, response_text=text_snippet)
         if status in {400, 404, 422}:
-            return ProviderCallError("request", status_code=status)
+            return ProviderCallError("request", status_code=status, response_text=text_snippet)
         if status >= 500:
-            return ProviderCallError("service", status_code=status)
-        return ProviderCallError("request", status_code=status)
+            return ProviderCallError("service", status_code=status, response_text=text_snippet)
+        return ProviderCallError("request", status_code=status, response_text=text_snippet)
 
 
 class CredentialResolver:
@@ -389,7 +421,7 @@ class LLMOrchestrator:
         )
         request_id = uuid.uuid4().hex
         try:
-            await self._invoke_with_retry(credential, "Reply with the single word: OK", 5, None)
+            await self._invoke_with_retry(credential, "Reply with the single word: OK", 100, None)
             return {"valid": True}
         except ProviderCallError as error:
             self._log_failure(
@@ -442,6 +474,10 @@ class LLMOrchestrator:
     def status(self, tenant_id: str | None) -> dict:
         normalized_tenant = (tenant_id or "").strip() or "unscoped"
         return {"tenant_id": normalized_tenant, "breakers": self._breakers.status(normalized_tenant)}
+
+    def reset_breaker(self, tenant_id: str, provider: str) -> None:
+        normalized_tenant = (tenant_id or "").strip() or "unscoped"
+        self._breakers.reset_tenant_provider(normalized_tenant, provider)
 
     @staticmethod
     def _label(identity: CredentialIdentity) -> str:

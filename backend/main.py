@@ -30,8 +30,9 @@ from slowapi.errors import RateLimitExceeded
 from backend.confidence import calculate_confidence
 from backend.sql_validator import extract_sql, validate_sql, validate_org_security
 from backend.mcp_client import host as mcp_host
-from backend.schema_graph import get_join_hints, force_anchor_tables
-from backend.query_intelligence import build_query_context
+from backend.schema_graph import get_join_hints, force_anchor_tables, expand_related_tables
+from backend.query_intelligence import build_query_context, extract_entities
+from backend.prompts import get_system_prompt
 
 # ChromaDB/embeddings may not be available on Windows (needs C++ build tools).
 # Gracefully degrade: the backend works without semantic retrieval (falls back to full schema).
@@ -708,6 +709,81 @@ def try_meta_query(question: str) -> dict | None:
     return None
 
 
+# ── Prompt size guard ─────────────────────────────────────────────────────────
+# Groq free tier allows only 12,000 tokens/min for llama-3.3-70b-versatile.
+# A single prompt with full schema can exceed this. This guard estimates
+# token count and progressively trims the schema DDL (removing the least
+# relevant tables last-to-first) until the prompt fits within budget.
+# The 70B model is preserved for accuracy — only the schema is trimmed.
+
+# Keep well below the shared Groq free-tier request budget.  The schema is
+# often much larger than the natural-language question, so a 7k-token prompt
+# can still be rejected with HTTP 413 before a model produces any output.
+_MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "3000"))
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English + SQL."""
+    return len(text) // 4
+
+
+def _trim_prompt_to_budget(prompt: str, schema_text: str, tables_used: list[str],
+                           max_tokens: int, budget: int = _MAX_PROMPT_TOKENS) -> tuple[str, str, list[str]]:
+    """
+    If the prompt + max_tokens exceeds `budget`, progressively remove the
+    last (least relevant) table DDLs from schema_text until it fits.
+    Returns (trimmed_prompt, trimmed_schema, trimmed_tables).
+    """
+    total = _estimate_tokens(prompt) + max_tokens
+    if total <= budget:
+        return prompt, schema_text, tables_used
+
+    # Schemas arrive from both the MCP server and ChromaDB.  Some use blank
+    # lines between DDLs, while the retriever uses a single newline.  Splitting
+    # only on blank lines treats a complete schema as one block, so it never
+    # gets trimmed and Groq returns HTTP 413 for the oversized request.
+    ddl_blocks = [b.strip() for b in re.split(
+        r"\n\s*(?=(?:CREATE\s+TABLE|Table\s+[^\s(]+\s*\(|--\s*(?:Table|table)\s*[:(]))",
+        schema_text,
+        flags=re.IGNORECASE,
+    ) if b.strip()]
+    if len(ddl_blocks) <= 1:
+        ddl_blocks = [b.strip() for b in schema_text.split("\n\n") if b.strip()]
+    if len(ddl_blocks) <= 1:
+        return prompt, schema_text, tables_used
+
+    # Remove the least relevant DDLs from the end until the whole request,
+    # including the expected completion, fits the configured budget.
+    original_schema = schema_text
+    original_prompt = prompt
+    trimmed_tables = list(tables_used)
+    candidate_prompt = prompt
+    while len(ddl_blocks) > 2:
+        candidate_schema = "\n\n".join(ddl_blocks)
+        candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
+        if _estimate_tokens(candidate_prompt) + max_tokens <= budget:
+            return candidate_prompt, candidate_schema, trimmed_tables
+        ddl_blocks.pop()
+        if trimmed_tables:
+            trimmed_tables.pop()
+
+    # Two selected tables are enough for a valid JOIN but can still contain
+    # unusually wide DDLs.  Respect the hard budget rather than sending a
+    # request Groq will reject; the first table is the most relevant one.
+    candidate_schema = "\n\n".join(ddl_blocks)
+    candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
+    allowed_schema_chars = max(
+        0,
+        (budget - max_tokens - _estimate_tokens(original_prompt.replace(original_schema, "", 1))) * 4,
+    )
+    if len(candidate_schema) > allowed_schema_chars:
+        omission_notice = "\n-- remaining schema omitted to fit the model request limit"
+        content_chars = max(0, allowed_schema_chars - len(omission_notice))
+        candidate_schema = candidate_schema[:content_chars].rsplit("\n", 1)[0] + omission_notice
+        candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
+    return candidate_prompt, candidate_schema, trimmed_tables[:len(ddl_blocks)]
+
+
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 async def generate_sql_with_retry(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False) -> dict:
     """
@@ -733,27 +809,52 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
     conv_context_block = build_conversation_context_block(context, question)
 
     # ── L2: Hybrid Retrieval ─────────────────────────────────────────────────
-    if is_index_ready():
+    retrieved_tables: list[str] = []
+    index_ready = is_index_ready()
+    if index_ready:
         retrieval = retrieve_tables(question, top_k=retrieval_top_k)
         tables_used       = retrieval["tables_used"]
+        retrieved_tables  = list(tables_used)
         similarity_scores = retrieval["similarity_scores"]
         schema_text       = retrieval["schema_text"]
     else:
-        # Fallback: full schema
+        # Without the embedding index, do not send all 234 tables and later
+        # truncate arbitrary ones.  Start with the question's known entities
+        # and join connectors, so complex queries keep the complete path.
         all_tables  = await mcp_host.list_tables()
-        schema_text = await mcp_host.get_schema(all_tables)
-        tables_used = all_tables
+        entity_tables = [
+            table for table in extract_entities(question)["tables"]
+            if table in all_tables
+        ]
+        tables_used = force_anchor_tables(question, entity_tables)
+        tables_used = [table for table in tables_used if table in all_tables]
+        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
+        if not tables_used:
+            tables_used = all_tables[:min(3, len(all_tables))]
+        schema_text = await mcp_host.get_schema(tables_used)
         similarity_scores = {}
 
     # Force anchor tables based on question keywords
     tables_used = force_anchor_tables(question, tables_used)
+    if complex_q:
+        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
+
+    # Retrieval's raw schema only contains the initially returned tables.
+    # Fetch DDL for anchors and graph connectors added above, otherwise a
+    # complex query would receive a join hint but not the table columns.
+    if index_ready:
+        added_tables = [table for table in tables_used if table not in retrieved_tables]
+        if added_tables:
+            extra_schema = get_schema_for_tables(added_tables)
+            if extra_schema:
+                schema_text = schema_text + "\n" + extra_schema
 
     # Follow-up questions ("filter that to critical only") often reuse the
     # previous turn's tables even when retrieval alone wouldn't surface them
     # (the follow-up text itself may not mention any table-like keywords).
     if context and is_followup_question(question) and context.tables_used:
         new_tables = [t for t in context.tables_used if t not in tables_used]
-        if new_tables and is_index_ready():
+        if new_tables and index_ready:
             extra_schema = get_schema_for_tables(new_tables)
             if extra_schema:
                 schema_text = schema_text + "\n" + extra_schema
@@ -800,7 +901,12 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
         else:
             org_hint = ""
 
-        system_prompt = COT_SYSTEM_PROMPT.format(num_tables=len(_known_tables) or 234)
+        # The legacy COT prompt alone consumes ~2,238 tokens.  With the
+        # request cap this left virtually no schema for the model, which made
+        # it guess joins, fail execution, and consume the Groq quota on a
+        # retry.  The maintained compact prompt leaves room for the relevant
+        # schema while retaining the SQL safety rules.
+        system_prompt = get_system_prompt()
         prompt = f"""{system_prompt}
 {ADVANCED_SQL_HINTS if complex_q else ""}
 {org_hint}
@@ -837,6 +943,10 @@ Question: {question}
         # block off mid-query — a real contributor to both the retries
         # (slowness) and the wrong-answer rate (accuracy) reported after
         # this was added.
+        # Trim prompt to fit within Groq free tier token budget
+        prompt, schema_text, tables_used = _trim_prompt_to_budget(
+            prompt, schema_text, tables_used, gen_max_tokens)
+
         try:
             raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
         except AllProvidersFailed as e:
@@ -1025,22 +1135,42 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     gen_max_tokens = 1000 if complex_q else 700
     conv_context_block = build_conversation_context_block(context, question)
 
-    if is_index_ready():
+    retrieved_tables: list[str] = []
+    index_ready = is_index_ready()
+    if index_ready:
         retrieval = retrieve_tables(question, top_k=retrieval_top_k)
         tables_used       = retrieval["tables_used"]
+        retrieved_tables  = list(tables_used)
         similarity_scores = retrieval["similarity_scores"]
         schema_text       = retrieval["schema_text"]
     else:
         all_tables  = await mcp_host.list_tables()
-        schema_text = await mcp_host.get_schema(all_tables)
-        tables_used = all_tables
+        entity_tables = [
+            table for table in extract_entities(question)["tables"]
+            if table in all_tables
+        ]
+        tables_used = force_anchor_tables(question, entity_tables)
+        tables_used = [table for table in tables_used if table in all_tables]
+        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
+        if not tables_used:
+            tables_used = all_tables[:min(3, len(all_tables))]
+        schema_text = await mcp_host.get_schema(tables_used)
         similarity_scores = {}
 
     tables_used = force_anchor_tables(question, tables_used)
+    if complex_q:
+        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
+
+    if index_ready:
+        added_tables = [table for table in tables_used if table not in retrieved_tables]
+        if added_tables:
+            extra_schema = get_schema_for_tables(added_tables)
+            if extra_schema:
+                schema_text = schema_text + "\n" + extra_schema
 
     if context and is_followup_question(question) and context.tables_used:
         new_tables = [t for t in context.tables_used if t not in tables_used]
-        if new_tables and is_index_ready():
+        if new_tables and index_ready:
             extra_schema = get_schema_for_tables(new_tables)
             if extra_schema:
                 schema_text = schema_text + "\n" + extra_schema
@@ -1083,7 +1213,7 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
         else:
             org_hint = ""
 
-        system_prompt = COT_SYSTEM_PROMPT.format(num_tables=len(_known_tables) or 234)
+        system_prompt = get_system_prompt()
         prompt = f"""{system_prompt}
 {ADVANCED_SQL_HINTS if complex_q else ""}
 {org_hint}
@@ -1114,6 +1244,10 @@ Question: {question}
 
         yield {"type": "status", "stage": "generating",
                "message": f"🧠 Generating SQL — attempt {attempt}/{MAX_ATTEMPTS}..."}
+
+        # Trim prompt to fit within Groq free tier token budget
+        prompt, schema_text, tables_used = _trim_prompt_to_budget(
+            prompt, schema_text, tables_used, gen_max_tokens)
 
         try:
             raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
@@ -1325,29 +1459,31 @@ async def add_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_curr
     result = save_key(req.provider, req.api_key, req.model, tenant_id)
     if not result.get("success"):
         raise HTTPException(400, result.get("error", "Failed to save key"))
+    llm_orchestrator.reset_breaker(tenant_id, req.provider)
     return result
 
 @app.delete("/settings/keys/{provider}")
 def remove_key(provider: str, customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
     """Remove a saved API key."""
-    return delete_key(provider, _settings_tenant(customer_id, user))
+    tenant_id = _settings_tenant(customer_id, user)
+    llm_orchestrator.reset_breaker(tenant_id, provider)
+    return delete_key(provider, tenant_id)
 
 @app.patch("/settings/keys/toggle")
 def toggle_provider(req: LLMKeyToggle, user: AuthenticatedUser = Depends(get_current_user)):
     """Enable or disable a provider without deleting the key."""
-    return toggle_key(req.provider, req.enabled, _settings_tenant(req.customer_id, user))
+    tenant_id = _settings_tenant(req.customer_id, user)
+    llm_orchestrator.reset_breaker(tenant_id, req.provider)
+    return toggle_key(req.provider, req.enabled, tenant_id)
 
 @app.post("/settings/keys/validate")
 async def check_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """Test an API key without saving it."""
-    req.provider = req.provider.strip().lower()
-    req.api_key = req.api_key.strip()
-    req.model = req.model.strip()
-    if req.provider not in PROVIDERS:
-        raise HTTPException(400, f"Unknown provider: {req.provider}")
-    if req.provider != "ollama" and not req.api_key:
-        return {"valid": False, "error": "API key is required"}
-    return await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
+    validation = await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
+    if validation.get("valid"):
+        tenant_id = _settings_tenant(req.customer_id, user)
+        llm_orchestrator.reset_breaker(tenant_id, req.provider)
+    return validation
 
 
 @app.get("/settings/llm-status")
@@ -1364,11 +1500,46 @@ def llm_status(customer_id: str = "default", user: AuthenticatedUser = Depends(g
     }
 
 
+def _build_tiered_circuit_status() -> dict:
+    """Map the system fallback chain to { primary, fallback1, fallback2 } for the frontend."""
+    from backend.llm_config import runtime_config
+    from backend.llm_registry import get_provider as _get_provider
+
+    snapshot = runtime_config.snapshot()
+    chain = snapshot.chain()  # e.g. ["groq", "gemini", "ollama"]
+    breaker_data = llm_orchestrator.status(None).get("breakers", {})
+
+    tier_names = ["primary", "fallback1", "fallback2"]
+    result = {}
+
+    for i, provider in enumerate(chain):
+        if i >= len(tier_names):
+            break
+        definition = _get_provider(provider)
+        display = snapshot.ollama_model if provider == "ollama" else definition.display_name
+
+        # A provider's circuit is open if any matching breaker entry is blocked or cooling down
+        circuit_open = False
+        for _key, state in breaker_data.items():
+            if state.get("provider") == provider:
+                if state.get("blocked") or state.get("seconds_until_recovery", 0) > 0:
+                    circuit_open = True
+                    break
+
+        result[tier_names[i]] = {
+            "name": display,
+            "provider": provider,
+            "circuit_open": circuit_open,
+        }
+
+    return result
+
+
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "circuit_breaker": llm_orchestrator.status(None),
+        "circuit_breaker": _build_tiered_circuit_status(),
         "embedding_index_ready": is_index_ready(),
         "llm": system_llm_status(),
     }

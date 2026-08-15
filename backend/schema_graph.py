@@ -132,12 +132,14 @@ SCHEMA_GRAPH: dict[str, dict[str, str]] = {
     },
     "device_installed_patch": {
         "managed_device": "device_installed_patch.managed_device_id = managed_device.id",
+        "org_patch": "device_installed_patch.patch_id = org_patch.patch_id",
     },
     "device_location": {
         "managed_device": "device_location.managed_device_id = managed_device.id",
     },
     "device_missing_patch": {
         "managed_device": "device_missing_patch.managed_device_id = managed_device.id",
+        "org_patch": "device_missing_patch.patch_id = org_patch.patch_id",
     },
     "device_network_map": {
         "managed_device": "device_network_map.managed_device_id = managed_device.id",
@@ -542,6 +544,37 @@ def get_join_hints(tables: list[str]) -> str:
     if not result:
         return ""
     return f"Suggested JOIN path starting from '{root}':\n" + "\n".join(result)
+
+
+def expand_related_tables(tables: list[str], max_tables: int = 12) -> list[str]:
+    """Add graph connector tables needed to join the requested entities.
+
+    Retrieval can identify the endpoints of a complex question but omit a
+    junction table.  Supplying those endpoints without their connector makes
+    the LLM invent a join.  Keep the original relevance order, then add only
+    the shortest-path connector tables within a small bounded schema set.
+    """
+    result = list(dict.fromkeys(table for table in tables if table))
+    if not HAS_NX or _G is None or len(result) < 2:
+        return result[:max_tables]
+
+    requested = list(result)
+    for index, source in enumerate(requested):
+        if not _G.has_node(source):
+            continue
+        for target in requested[index + 1:]:
+            if not _G.has_node(target):
+                continue
+            try:
+                path = nx.shortest_path(_G, source, target)
+            except Exception:
+                continue
+            for table in path:
+                if table not in result:
+                    result.append(table)
+                    if len(result) >= max_tables:
+                        return result
+    return result[:max_tables]
 
 
 def force_anchor_tables(question: str, retrieved: list[str]) -> list[str]:

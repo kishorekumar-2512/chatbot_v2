@@ -84,7 +84,7 @@ export default function SettingsDrawer() {
   const handleTest = async () => {
     setTestResult(null);
     try {
-      const res = await validateKey({ provider, api_key: apiKey, model });
+      const res = await validateKey({ provider, api_key: apiKey, model, customer_id: customerId });
       setTestResult(
         res.valid
           ? { ok: true, msg: '✅ Key is valid!' }
