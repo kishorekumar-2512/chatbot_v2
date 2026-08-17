@@ -1,140 +1,162 @@
-###############################################################################
-# CI/CD — Deploy Backend (ECS) & Frontend (S3 + CloudFront)
-#
-# Trigger:  push to main
-# Auth:     OIDC (no static AWS keys)
-# Secrets required:
-#   AWS_ROLE_ARN              – IAM role ARN trusted by the GitHub OIDC provider
-#   ECR_BACKEND_REPO          – Full ECR repo URL  (e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com/chatbot-backend)
-#   ECS_CLUSTER               – ECS cluster name
-#   ECS_SERVICE               – ECS service name
-#   S3_FRONTEND_BUCKET        – S3 bucket name for the React frontend
-#   CLOUDFRONT_DISTRIBUTION_ID – CloudFront distribution to invalidate
-#   BACKEND_PUBLIC_URL        – Public URL of the backend API
-#   ADMIN_API_KEY             – Admin key for the /admin/reindex endpoint
-###############################################################################
-
-name: Deploy
+name: Production Blue-Green CI/CD Pipeline
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      manual_cutover_target:
+        description: 'Manually force deploy to specific color (auto / blue / green)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - blue
+          - green
 
-# Required for OIDC token to be issued to this workflow
 permissions:
-  id-token: write
   contents: read
+  packages: write
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
+  group: blue-green-deploy
+  cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Build & Deploy
+  build-and-push:
+    name: Build & Push Container Images
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    outputs:
+      backend_image: ${{ steps.meta-backend.outputs.tags }}
+      web_image: ${{ steps.meta-web.outputs.tags }}
 
     steps:
-      # ---------------------------------------------------------------
-      # 1. Checkout
-      # ---------------------------------------------------------------
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------------------
-      # 2. Configure AWS credentials (OIDC — no static keys)
-      # ---------------------------------------------------------------
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ap-south-1
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------------------------------------------------------------
-      # 3. Login to Amazon ECR
-      # ---------------------------------------------------------------
-      - name: Login to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Extract metadata for Backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/chatbot-backend
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
 
-      # ---------------------------------------------------------------
-      # 4–5. Build & push backend Docker image
-      # ---------------------------------------------------------------
-      - name: Build & push backend image
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for Web SPA
+        id: meta-web
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/chatbot-web
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - name: Build and push Web SPA image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          file: web/Dockerfile
+          push: true
+          tags: ${{ steps.meta-web.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-blue-green:
+    name: Deploy to Idle Stack & Zero-Downtime Cutover
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Execute Blue-Green Deployment over SSH
+        uses: appleboy/ssh-action@v1.0.3
         env:
-          ECR_REPO: ${{ secrets.ECR_BACKEND_REPO }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REPO:$IMAGE_TAG -t $ECR_REPO:latest \
-            -f backend/Dockerfile .
-          docker push $ECR_REPO:$IMAGE_TAG
-          docker push $ECR_REPO:latest
-
-      # ---------------------------------------------------------------
-      # 6. Deploy to ECS (force new deployment)
-      # ---------------------------------------------------------------
-      - name: Deploy to ECS
-        run: |
-          aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --force-new-deployment \
-            --region ap-south-1
-
-      # ---------------------------------------------------------------
-      # 7. Build React frontend
-      # ---------------------------------------------------------------
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          IMAGE_TAG: sha-${{ github.sha }}
+          MANUAL_TARGET: ${{ inputs.manual_cutover_target || 'auto' }}
+          REPO_NAME: ${{ github.repository }}
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: IMAGE_TAG,MANUAL_TARGET,REPO_NAME
+          script: |
+            set -euo pipefail
+            cd /opt/chatbot_v2
 
-      - name: Build frontend
-        run: |
-          cd web
-          npm ci
-          VITE_API_URL=${{ secrets.BACKEND_PUBLIC_URL }} npm run build
+            # 1. Determine active and idle colors
+            if [[ -f .active_color ]]; then
+              ACTIVE_COLOR=$(cat .active_color)
+            else
+              ACTIVE_COLOR="blue"
+              echo "blue" > .active_color
+            fi
 
-      # ---------------------------------------------------------------
-      # 8. Sync frontend build to S3
-      # ---------------------------------------------------------------
-      - name: Sync to S3
-        run: |
-          aws s3 sync web/dist/ s3://${{ secrets.S3_FRONTEND_BUCKET }} \
-            --delete \
-            --region ap-south-1
+            if [[ "$MANUAL_TARGET" != "auto" ]]; then
+              IDLE_COLOR="$MANUAL_TARGET"
+            else
+              if [[ "$ACTIVE_COLOR" == "blue" ]]; then
+                IDLE_COLOR="green"
+              else
+                IDLE_COLOR="blue"
+              fi
+            fi
 
-      # ---------------------------------------------------------------
-      # 9. Invalidate CloudFront cache
-      # ---------------------------------------------------------------
-      - name: Invalidate CloudFront
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
-            --paths "/*"
+            echo "=========================================================="
+            echo " Current Active: $ACTIVE_COLOR"
+            echo " Target Idle:    $IDLE_COLOR (Deploying new release)"
+            echo " Image Tag:      $IMAGE_TAG"
+            echo "=========================================================="
 
-      # ---------------------------------------------------------------
-      # 10. Wait for ECS service to stabilize
-      # ---------------------------------------------------------------
-      - name: Wait for ECS to stabilize
-        run: sleep 60
+            # 2. Pull new container images
+            export BACKEND_IMAGE="ghcr.io/${REPO_NAME}/chatbot-backend:${IMAGE_TAG}"
+            export WEB_IMAGE="ghcr.io/${REPO_NAME}/chatbot-web:${IMAGE_TAG}"
 
-      # ---------------------------------------------------------------
-      # 11. Post-deploy — trigger reindex
-      # ---------------------------------------------------------------
-      - name: Trigger reindex
-        run: |
-          curl -X POST "${{ secrets.BACKEND_PUBLIC_URL }}/admin/reindex" \
-            -H "X-Admin-Key: ${{ secrets.ADMIN_API_KEY }}" \
-            --fail --silent --show-error --max-time 30
+            echo "Pulling images..."
+            docker compose -f "docker-compose.${IDLE_COLOR}.yml" pull
 
-      # ---------------------------------------------------------------
-      # 12. Health check
-      # ---------------------------------------------------------------
-      - name: Health check
-        run: |
-          curl -f "${{ secrets.BACKEND_PUBLIC_URL }}/health" \
-            --silent --show-error --max-time 15
+            # 3. Start idle stack
+            echo "Bringing up ${IDLE_COLOR^^} stack..."
+            docker compose -f "docker-compose.${IDLE_COLOR}.yml" up -d --remove-orphans
+
+            # 4. Run automated health check against idle stack
+            echo "Running smoke tests on ${IDLE_COLOR^^} stack..."
+            if ! ./scripts/health_check.sh "$IDLE_COLOR" 12 5; then
+              echo "❌ Deployment failed smoke tests on ${IDLE_COLOR^^}! Keeping ${ACTIVE_COLOR^^} live."
+              docker compose -f "docker-compose.${IDLE_COLOR}.yml" stop
+              exit 1
+            fi
+
+            # 5. Atomic zero-downtime cutover
+            echo "Health checks passed! Switching traffic to ${IDLE_COLOR^^}..."
+            ./scripts/switch_traffic.sh "$IDLE_COLOR"
+
+            echo "=========================================================="
+            echo "✅ Release successfully deployed & live on ${IDLE_COLOR^^}!"
+            echo "   Old stack (${ACTIVE_COLOR^^}) kept running for instant rollback."
+            echo "=========================================================="

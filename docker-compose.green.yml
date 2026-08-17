@@ -1,0 +1,65 @@
+# docker-compose.green.yml
+# Production Green stack for Blue-Green deployment pipeline.
+#
+# Ports:
+#   web-green:     8082 -> 80 (routed via Host Nginx)
+#   backend-green: 8002 -> 8000
+
+services:
+  backend-green:
+    image: ${BACKEND_IMAGE:-ghcr.io/kishorekumar-2512/chatbot-backend:latest}
+    container_name: chatbot-backend-green
+    restart: unless-stopped
+    env_file:
+      - .env.green
+    environment:
+      - FRONTEND_ORIGIN=http://localhost:8082,http://localhost
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - chroma_data:/app/embeddings/chroma_store
+      - key_store_data:/app/data
+      - feedback_data:/app/feedback
+      - reports_data:/app/reports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    networks:
+      - green-network
+
+  web-green:
+    image: ${WEB_IMAGE:-ghcr.io/kishorekumar-2512/chatbot-web:latest}
+    container_name: chatbot-web-green
+    restart: unless-stopped
+    environment:
+      - BACKEND_UPSTREAM=http://backend-green:8000
+    ports:
+      - "127.0.0.1:8082:80"
+    depends_on:
+      backend-green:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - green-network
+
+networks:
+  green-network:
+    name: chatbot_green_network
+
+volumes:
+  chroma_data:
+    name: chatbot_shared_chroma_data
+  key_store_data:
+    name: chatbot_shared_key_store_data
+  feedback_data:
+    name: chatbot_shared_feedback_data
+  reports_data:
+    name: chatbot_shared_reports_data

@@ -1,6 +1,8 @@
 # ── Secrets & Environment (NEVER commit these) ──────────────────────────────
 .env
 .env.save
+.env.blue
+.env.green
 
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
@@ -21,6 +23,14 @@ embeddings/chroma_store/
 data/llm_keys.json
 feedback_log.jsonl
 reports/*.pdf
+*.dump
+enum_search_results.json
+final_search_report.json
+all_lookup_tables.json
+candidates_raw.json
+classified_buckets.json
+lookup_audit_results.json
+lookup_tables_data.json
 
 # ── Node / React frontend ──────────────────────────────────────────────────
 web/node_modules/

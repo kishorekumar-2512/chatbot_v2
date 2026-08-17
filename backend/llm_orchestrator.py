@@ -260,7 +260,9 @@ class ProviderGateway:
             if style == "anthropic":
                 text = data["content"][0]["text"]
             elif style == "gemini":
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+                text = "".join(text_parts)
             elif style == "ollama":
                 text = data["response"]
             else:
@@ -421,7 +423,7 @@ class LLMOrchestrator:
         )
         request_id = uuid.uuid4().hex
         try:
-            await self._invoke_with_retry(credential, "Reply with the single word: OK", 100, None)
+            await self._invoke_with_retry(credential, "Reply with the single word: OK", 200, None)
             return {"valid": True}
         except ProviderCallError as error:
             self._log_failure(

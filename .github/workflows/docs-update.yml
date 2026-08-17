@@ -1,0 +1,141 @@
+name: Living Project Documentation & PDF Pipeline
+
+on:
+  push:
+    branches:
+      - '**'
+    paths-ignore:
+      - 'docs/**'
+      - 'reports/**'
+      - '.active_color'
+  pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - 'docs/**'
+      - 'reports/**'
+      - '.active_color'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: docs-pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1. AI-Powered Markdown Docs Sync (Generates PR for Human Review)
+  # --------------------------------------------------------------------------
+  update-project-docs:
+    name: Reason & Update PROJECT_DOCS.md
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install httpx
+
+      - name: Run Living Docs AI Updater
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python scripts/update_docs_ai.py
+
+      - name: Check for documentation changes
+        id: git-check
+        run: |
+          if git diff --quiet PROJECT_DOCS.md; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No documentation changes required."
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Documentation changes detected."
+          fi
+
+      - name: Create Pull Request with Documentation Update
+        if: steps.git-check.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "docs(living-docs): update PROJECT_DOCS.md [skip ci]"
+          title: "docs(living-docs): update PROJECT_DOCS.md for commit ${{ github.sha }}"
+          body: |
+            ### Living Project Documentation Auto-Update
+
+            This automated pull request updates [`PROJECT_DOCS.md`](file:///c:/Users/kisho/OneDrive/Desktop/chatbot_v2/PROJECT_DOCS.md) to reflect changes in commit `${{ github.sha }}`.
+
+            #### What Changed:
+            - **Current State Sections (2–6)**: Refreshed in place if any architecture, file references, or pipelines were affected.
+            - **Update Log (Section 7)**: Appended new dated entry with architectural reasoning.
+            - **Sync Watermark**: Advanced `docs-last-synced` comment.
+
+            > **Human Checkpoint**: Please review the inferred reasoning before merging this pull request.
+          branch: docs/auto-update-${{ github.sha }}
+          delete-branch: true
+          labels: |
+            documentation
+            automated-pr
+
+  # --------------------------------------------------------------------------
+  # 2. Automated PDF Exporter (Runs on main branch post-merge)
+  # --------------------------------------------------------------------------
+  render-docs-pdf:
+    name: Pre-render Diagrams & Compile PDF
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install PDF Generation Dependencies
+        run: |
+          pip install fpdf2 httpx Pillow
+
+      - name: Generate Publication-Quality PDF
+        run: |
+          python scripts/generate_docs_pdf.py
+
+      - name: Check for PDF modifications
+        id: pdf-check
+        run: |
+          if git status --porcelain docs/PROJECT_DOCS.pdf reports/project_documentation.pdf | grep -q .; then
+            echo "pdf_changed=true" >> $GITHUB_OUTPUT
+            echo "PDF documentation updated."
+          else
+            echo "pdf_changed=false" >> $GITHUB_OUTPUT
+            echo "No PDF changes detected."
+          fi
+
+      - name: Commit & Push Updated PDF to main
+        if: steps.pdf-check.outputs.pdf_changed == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/PROJECT_DOCS.pdf reports/project_documentation.pdf
+          git commit -m "docs(pdf): auto-generate docs/PROJECT_DOCS.pdf [skip ci]"
+          git push

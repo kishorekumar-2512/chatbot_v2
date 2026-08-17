@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import dotenv_values, load_dotenv
 import httpx
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Step 1: Show how the app reads keys ──────────────────────────────────────
 print("=" * 70)
 print("STEP 1: How the app reads your .env keys")
@@ -31,16 +34,14 @@ print(f"\nGROQ_API_KEY (dotenv_values): '{groq_key_dotenv[:10]}...{groq_key_dote
 print(f"GROQ_API_KEY (os.getenv):     '{groq_key_osenv[:10]}...{groq_key_osenv[-6:]}' (len={len(groq_key_osenv)})")
 print(f"GROQ keys match: {groq_key_dotenv == groq_key_osenv}")
 print(f"GROQ key has whitespace: {groq_key_dotenv != groq_key_dotenv.strip()}")
-print(f"GROQ key repr: {repr(groq_key_dotenv[:15])}...{repr(groq_key_dotenv[-10:])}")
 
 print(f"\nGEMINI_API_KEY (dotenv_values): '{gemini_key_dotenv[:10]}...{gemini_key_dotenv[-6:]}' (len={len(gemini_key_dotenv)})")
 print(f"GEMINI_API_KEY (os.getenv):     '{gemini_key_osenv[:10]}...{gemini_key_osenv[-6:]}' (len={len(gemini_key_osenv)})")
 print(f"GEMINI keys match: {gemini_key_dotenv == gemini_key_osenv}")
 print(f"GEMINI key has whitespace: {gemini_key_dotenv != gemini_key_dotenv.strip()}")
-print(f"GEMINI key repr: {repr(gemini_key_dotenv[:15])}...{repr(gemini_key_dotenv[-10:])}")
 
-groq_model = file_values.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-gemini_model = file_values.get("GEMINI_MODEL", "gemini-2.0-flash")
+groq_model = file_values.get("GROQ_MODEL", "openai/gpt-oss-120b")
+gemini_model = file_values.get("GEMINI_MODEL", "gemini-3.6-flash")
 print(f"\nGROQ_MODEL:  {groq_model}")
 print(f"GEMINI_MODEL: {gemini_model}")
 
@@ -78,7 +79,7 @@ async def test_groq():
     payload = {
         "model": groq_model,
         "messages": [{"role": "user", "content": "Reply with: OK"}],
-        "max_tokens": 10,
+        "max_tokens": 100,
         "temperature": 0.1,
     }
     try:
@@ -87,15 +88,15 @@ async def test_groq():
             print(f"  Status: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
-                text = data["choices"][0]["message"]["content"]
-                print(f"  Response: {text}")
-                print("  ✅ GROQ SYSTEM KEY WORKS!")
+                text = data["choices"][0]["message"].get("content", "")
+                print(f"  Response: {text.strip()}")
+                print("  [OK] GROQ SYSTEM KEY WORKS!")
             else:
                 print(f"  Response: {resp.text[:300]}")
-                print("  ❌ GROQ SYSTEM KEY FAILED!")
+                print("  [FAIL] GROQ SYSTEM KEY FAILED!")
     except Exception as e:
         print(f"  Error: {e}")
-        print("  ❌ GROQ SYSTEM KEY FAILED!")
+        print("  [FAIL] GROQ SYSTEM KEY FAILED!")
 
 
 asyncio.run(test_groq())
@@ -114,7 +115,7 @@ async def test_gemini():
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": "Reply with: OK"}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 10},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200},
     }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -122,15 +123,16 @@ async def test_gemini():
             print(f"  Status: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                print(f"  Response: {text}")
-                print("  ✅ GEMINI SYSTEM KEY WORKS!")
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
+                print(f"  Response: {text.strip()}")
+                print("  [OK] GEMINI SYSTEM KEY WORKS!")
             else:
                 print(f"  Response: {resp.text[:300]}")
-                print("  ❌ GEMINI SYSTEM KEY FAILED!")
+                print("  [FAIL] GEMINI SYSTEM KEY FAILED!")
     except Exception as e:
-        print(f"  Error: {e}")
-        print("  ❌ GEMINI SYSTEM KEY FAILED!")
+        print(f"  Error: {type(e).__name__}: {e}")
+        print("  [FAIL] GEMINI SYSTEM KEY FAILED!")
 
 
 asyncio.run(test_gemini())

@@ -14,6 +14,7 @@ every time.
 import os, sys
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import chromadb
@@ -1224,7 +1225,25 @@ RICH_COLUMN_DESCRIPTIONS = {
         "device_name": "The hostname or user-friendly name of the managed machine",
         "zecure_org_id": "Organization tenant identifier to enforce strict data security boundaries",
         "status": "Active deployment status of the managed device (e.g. active, inactive, pending)",
-    }
+    },
+    "em_roles": {
+        "role_type": "Role type category. One of [0 ('Super Admin'), 1 ('Admin'), 2 ('Technician')]",
+    },
+    "hardware_type": {
+        "hardware_type": "Hardware type category code. One of [1 ('Operating System'), 2 ('BIOS'), 3 ('Processor'), 4 ('Logical Disk Partition'), 5 ('Keyboard'), 6 ('CD-ROM Drive'), 7 ('Hard Disk Drive'), 8 ('Sound Device'), 9 ('Video Controller'), 10 ('Network Adapter')]",
+    },
+    "asset_resource": {
+        "asset_type": "Asset hardware type identifier. One of [1 ('Operating System'), 2 ('BIOS'), 3 ('Processor'), 4 ('Logical Disk Partition'), 5 ('Keyboard'), 6 ('CD-ROM Drive'), 7 ('Hard Disk Drive'), 8 ('Sound Device'), 9 ('Video Controller'), 10 ('Network Adapter'), 11 ('Pointing Device'), 12 ('Desktop Monitor'), 13 ('Mother Board'), 14 ('Battery'), 15 ('Printer'), 16 ('USB Hub'), 17 ('USB Controller'), 18 ('IDE Controller'), 19 ('PCMCIA Controller'), 20 ('Serial Port'), 21 ('Parallel Port'), 22 ('1394 Controller'), 23 ('Floppy Drive'), 24 ('Tape Drive'), 25 ('System Slot'), 26 ('Memory Slot'), 27 ('Physical Memory Array'), 28 ('TPM')]",
+    },
+    "patch_type_mapping": {
+        "patch_type_id": "Patch category identifier. One of [1 ('Security - Security vulnerability fixes'), 2 ('Critical - Critical non-security fixes'), 3 ('Definition - Antivirus / signature updates'), 4 ('Feature - New feature additions'), 5 ('Upgrade - OS version upgrade'), 6 ('Non-Security'), 7 ('Driver'), 8 ('Rollup')]",
+    },
+    "software": {
+        "software_category_id": "Software classification category. One of [1 ('Not Assigned'), 2 ('Development'), 3 ('UI Design'), 4 ('Productivity & Office Applications'), 5 ('Web Browsers'), 6 ('System Utilities'), 7 ('Security'), 8 ('Media & Graphics'), 9 ('Communication'), 10 ('Business'), 11 ('Miscellaneous')]",
+    },
+    "reports_type": {
+        "category_id": "Report category identifier. One of [1 ('Security & Protection - TPM, Bitlocker, Antivirus, Firewall'), 2 ('Hardware Inventory - Hardware Age, Specs'), 3 ('Patch Management - Patch Summary, Missing Patches'), 4 ('Software Management - Software Inventory'), 5 ('General Overview')]",
+    },
 }
 
 
@@ -1283,15 +1302,26 @@ def build_index(incremental: bool = True) -> dict:
         collection = client.create_collection(COLLECTION_NAME)
         existing_hashes = {}
     else:
-        collection = _get_collection(client)
-        existing = collection.get(include=["metadatas"])
-        existing_hashes = {
-            tid: (meta or {}).get("content_hash")
-            for tid, meta in zip(existing["ids"], existing["metadatas"])
-        }
+        try:
+            collection = _get_collection(client)
+            existing = collection.get(include=["metadatas"])
+            existing_hashes = {
+                tid: (meta or {}).get("content_hash")
+                for tid, meta in zip(existing["ids"], existing["metadatas"])
+            }
+        except Exception as e:
+            print(f"Warning: Existing ChromaDB index format incompatible with this environment ({e}).")
+            print("Recreating collection cleanly...")
+            try:
+                client.delete_collection(COLLECTION_NAME)
+            except Exception:
+                pass
+            collection = client.create_collection(COLLECTION_NAME)
+            existing_hashes = {}
 
     current_names = {t["table_name"] for t in tables}
     to_upsert = [t for t in tables if existing_hashes.get(t["table_name"]) != t["content_hash"]]
+    # Also remove stale _partN chunk entries that are no longer in the current set
     to_remove = [tid for tid in existing_hashes if tid not in current_names]
     unchanged = len(tables) - len(to_upsert)
 
@@ -1308,8 +1338,10 @@ def build_index(incremental: bool = True) -> dict:
             embeddings=embeddings,
             documents=[t["description"] for t in to_upsert],
             metadatas=[{
-                "table_name": t["table_name"], "raw_ddl": t["raw_ddl"],
-                "content_hash": t["content_hash"], "source": t.get("source", "manual"),
+                "table_name": t.get("_base_table", t["table_name"]),
+                "raw_ddl": t["raw_ddl"],
+                "content_hash": t["content_hash"],
+                "source": t.get("source", "manual"),
             } for t in to_upsert],
         )
     else:
