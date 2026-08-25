@@ -9,7 +9,9 @@ backend/main.py — Maximum accuracy version.
   L5: SQL Generation      — chain-of-thought prompt + circuit breaker LLMs
   L6: Self Correction     — retry with diff context + zero-row diagnosis + sanity check
 """
-
+import threading
+import httpx
+import uvicorn
 import os, re, time, json, asyncio
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
@@ -20,14 +22,12 @@ import psycopg2, psycopg2.extras, psycopg2.pool
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from backend.confidence import calculate_confidence
 from backend.sql_validator import extract_sql, validate_sql, validate_org_security
 from backend.mcp_client import host as mcp_host
 from backend.schema_graph import get_join_hints, force_anchor_tables, expand_related_tables
@@ -63,13 +63,11 @@ from backend.self_correction import (
     sanity_check, generate_answer, check_sql_quality, try_auto_repair,
 )
 from backend.insights import compute_quick_stats, generate_followups
-from backend.chart_builder import build_chart
 from backend.auth import get_current_user, AuthenticatedUser, REQUIRE_AUTH
 
 # load_dotenv() - already called at the top
 
 DATABASE_URL    = os.getenv("DATABASE_URL")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:8501")
 MAX_ATTEMPTS    = 3
 
 
@@ -152,9 +150,11 @@ async def lifespan(app: FastAPI):
     fetch_rich_descriptions()
     await mcp_host.start()
     _scheduler_task = asyncio.create_task(_periodic_reindex_loop())
+    server2_task = asyncio.create_task(_start_server2())
     yield
     if _scheduler_task:
         _scheduler_task.cancel()
+    server2_task.cancel()
     await mcp_host.stop()
 
 
@@ -163,18 +163,6 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="AI Database Report Chatbot — Max Accuracy", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-FRONTEND_ORIGIN_REACT = os.getenv("FRONTEND_ORIGIN_REACT", "http://localhost:5173")
-CLOUDFRONT_ORIGIN = os.getenv("CLOUDFRONT_ORIGIN", "")  # e.g. https://d1234abcd.cloudfront.net
-_cors_origins = [FRONTEND_ORIGIN, FRONTEND_ORIGIN_REACT]
-if CLOUDFRONT_ORIGIN:
-    _cors_origins.append(CLOUDFRONT_ORIGIN)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["*"],
-)
 
 # ── Rich descriptions from PostgreSQL comments ───────────────────────────────
 TABLE_DESCRIPTIONS: dict = {}
@@ -621,17 +609,6 @@ def try_meta_query(question: str) -> dict | None:
     """
     q = question.strip()
 
-    # NOTE: confidence must match calculate_confidence()'s real shape
-    # (table_relevance / column_accuracy / attempt_score / row_sanity /
-    # overall / level) — the frontend's render_meta() reads c.get('overall')
-    # and c.get('table_relevance') etc, so a dict with different keys would
-    # silently render as 0/100 everywhere.
-    _DETERMINISTIC_CONFIDENCE = {
-        "table_relevance": 100.0, "column_accuracy": 100.0,
-        "attempt_score": 100.0, "row_sanity": 100.0,
-        "overall": 100.0, "level": "high",
-    }
-
     if _META_ALL_COLUMNS_RE.search(q):
         rows = [{"table_name": t, "column_count": len(_known_columns.get(t, []))} for t in sorted(_known_tables)]
         answer = (
@@ -642,9 +619,9 @@ def try_meta_query(question: str) -> dict | None:
         return {
             "sql": "SELECT table_name, COUNT(*) AS column_count FROM information_schema.columns "
                    "WHERE table_schema='public' GROUP BY table_name ORDER BY table_name;",
-            "rows": rows, "answer": answer, "chart_json": None,
+            "rows": rows, "answer": answer,
             "model_used": "schema-cache (no LLM used)", "attempts": 1,
-            "tables_used": [], "confidence": _DETERMINISTIC_CONFIDENCE,
+            "tables_used": [],
             "sql_warnings": [], "intent": "META",
             "insights": [f"Tables: {len(_known_tables)}", f"Total columns across schema: {sum(len(c) for c in _known_columns.values())}"],
             "followups": ["List all tables", "What columns does customer have?"],
@@ -656,9 +633,9 @@ def try_meta_query(question: str) -> dict | None:
         return {
             "sql": "SELECT table_name FROM information_schema.tables "
                    "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name;",
-            "rows": rows, "answer": answer, "chart_json": None,
+            "rows": rows, "answer": answer,
             "model_used": "schema-cache (no LLM used)", "attempts": 1,
-            "tables_used": [], "confidence": _DETERMINISTIC_CONFIDENCE,
+            "tables_used": [],
             "sql_warnings": [], "intent": "META",
             "insights": [f"Tables: {len(_known_tables)}"],
             "followups": ["Show all columns of every table", "What columns does customer have?"],
@@ -685,23 +662,21 @@ def try_meta_query(question: str) -> dict | None:
             return {
                 "sql": f"SELECT column_name FROM information_schema.columns "
                        f"WHERE table_schema='public' AND table_name='{table}' ORDER BY ordinal_position;",
-                "rows": rows, "answer": answer, "chart_json": None,
+                "rows": rows, "answer": answer,
                 "model_used": "schema-cache (no LLM used)", "attempts": 1,
-                "tables_used": [table], "confidence": _DETERMINISTIC_CONFIDENCE,
+                "tables_used": [table],
                 "sql_warnings": [], "intent": "META",
                 "insights": [f"Columns: {len(cols)}"],
                 "followups": [f"Show me 5 rows from {table}", "List all tables"],
             }
         elif candidate:
-            # They asked about a table-like name we don't recognize — say so
-            # plainly instead of letting the LLM hallucinate a guess.
             close = [t for t in _known_tables if candidate.lower() in t.lower() or t.lower() in candidate.lower()]
             hint = f" Did you mean: {', '.join(sorted(close)[:5])}?" if close else ""
             return {
-                "sql": "", "rows": [], "chart_json": None,
+                "sql": "", "rows": [],
                 "answer": f"I couldn't find a table called '{candidate}' in the schema.{hint}",
                 "model_used": "schema-cache (no LLM used)", "attempts": 1,
-                "tables_used": [], "confidence": {**_DETERMINISTIC_CONFIDENCE, "column_accuracy": 0.0, "overall": 60.0, "level": "medium"},
+                "tables_used": [],
                 "sql_warnings": [], "intent": "META",
                 "insights": [], "followups": ["List all tables"],
             }
@@ -1026,15 +1001,6 @@ Question: {question}
         # ── Store successful example for future retrieval ─────────────────────
         store_successful_example(question, sql, len(rows))
 
-        # ── Confidence scoring ───────────────────────────────────────────────
-        confidence = calculate_confidence(
-            similarity_scores=similarity_scores,
-            tables_used=tables_used,
-            validation_errors=validation_errors,
-            attempt_number=attempt,
-            row_count=len(rows),
-        )
-
         return {
             "sql":               sql,
             "rows":              rows,
@@ -1042,7 +1008,6 @@ Question: {question}
             "model_used":        model_used,
             "attempts":          attempt,
             "tables_used":       tables_used,
-            "confidence":        confidence,
             "sql_warnings":      warnings,
             "intent":            qctx["intent"],
             "insights":          quick_stats,
@@ -1056,6 +1021,41 @@ Question: {question}
         f"Last error: {failed_attempts[-1][1] if failed_attempts else 'unknown'}"
     )
 
+class ConversationContext(BaseModel):
+    question: str
+    sql: str
+    tables_used: list[str] = []
+
+# ── SERVER 2 — Internal processing server (runs on port 8001) ────────────────
+server2 = FastAPI(title="chatbot_v2 — Processing Server")
+
+class Server2Request(BaseModel):
+    question: str
+    context: Optional["ConversationContext"] = None
+    org_id: Optional[str] = None
+    all_orgs: bool = False
+
+@server2.post("/process")
+async def server2_process(req: Server2Request):
+    result = await generate_sql_with_retry(
+        req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs
+    )
+    # Response trimmed to sql/model_used/attempts — full fields available internally,
+    # re-enable for frontend later
+    return {
+        "sql": result["sql"],
+        "model_used": result["model_used"],
+        "attempts": result["attempts"],
+    }
+
+
+_server2_instance: Optional["uvicorn.Server"] = None
+
+async def _start_server2():
+    global _server2_instance
+    config = uvicorn.Config(server2, host="127.0.0.1", port=8001, log_level="info")
+    _server2_instance = uvicorn.Server(config)
+    await _server2_instance.serve()
 
 # ── Streaming pipeline (powers /chat/stream — live progress + model thinking) ─
 async def generate_sql_streaming(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False, image_base64: str | None = None):
@@ -1120,8 +1120,6 @@ async def generate_sql_streaming(question: str, context: "ConversationContext | 
     meta_result = try_meta_query(question)
     if meta_result is not None:
         yield {"type": "status", "stage": "meta", "message": "📚 Answering directly from schema cache (no model needed)..."}
-        chart_json, chart_kind, single_stat = build_chart(meta_result["rows"], title=question, question=question)
-        meta_result["chart_json"], meta_result["chart_kind"], meta_result["single_stat"] = chart_json, chart_kind, single_stat
         meta_result["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 1)
         yield {"type": "final", "data": meta_result}
         return
@@ -1324,31 +1322,15 @@ Question: {question}
         followups = generate_followups(question, rows, sql, qctx["intent"])
         store_successful_example(question, sql, len(rows))
 
-        confidence = calculate_confidence(
-            similarity_scores=similarity_scores,
-            tables_used=tables_used,
-            validation_errors=validation_errors,
-            attempt_number=attempt,
-            row_count=len(rows),
-        )
-
-        # Smart auto-chart: picks type by result shape (line/area/bar/donut/
-        # grouped-bar/single-stat) instead of the old "only 2 columns" rule.
-        chart_json, chart_kind, single_stat = build_chart(rows, title=question, question=question)
-
         latency_ms = round((time.perf_counter() - start_total) * 1000, 1)
 
         yield {"type": "final", "data": {
             "sql":          sql,
             "rows":         rows,
             "answer":       answer,
-            "chart_json":   chart_json,
-            "chart_kind":   chart_kind,
-            "single_stat":  single_stat,
             "model_used":   model_used,
             "attempts":     attempt,
             "tables_used":  tables_used,
-            "confidence":   confidence,
             "sql_warnings": warnings,
             "intent":       qctx["intent"],
             "latency_ms":   latency_ms,
@@ -1374,10 +1356,7 @@ class LLMKeyToggle(BaseModel):
     enabled: bool
     customer_id: str = "default"
 
-class ConversationContext(BaseModel):
-    question: str
-    sql: str
-    tables_used: list[str] = []
+
 
 class ChatRequest(BaseModel):
     question: str
@@ -1394,10 +1373,6 @@ class ChatResponse(BaseModel):
     sql: str
     rows: list[dict]
     answer: str
-    chart_json: Optional[str] = None
-    chart_kind: Optional[str] = None
-    single_stat: Optional[dict] = None
-    confidence: dict
     model_used: str
     cached: bool = False
     attempts: int
@@ -1408,11 +1383,7 @@ class ChatResponse(BaseModel):
     insights: list[str] = []
     followups: list[str] = []
 
-class ReportRequest(BaseModel):
-    question: str
-    sql: str
-    rows: list[dict]
-    chart_json: Optional[str] = None
+
 
 
 def _settings_tenant(customer_id: str | None, user: AuthenticatedUser | None) -> str:
@@ -1501,7 +1472,7 @@ def llm_status(customer_id: str = "default", user: AuthenticatedUser = Depends(g
 
 
 def _build_tiered_circuit_status() -> dict:
-    """Map the system fallback chain to { primary, fallback1, fallback2 } for the frontend."""
+    """Map the system fallback chain to { primary, fallback1, fallback2 } for API consumers."""
     from backend.llm_config import runtime_config
     from backend.llm_registry import get_provider as _get_provider
 
@@ -1560,7 +1531,7 @@ def circuit_status(customer_id: str = "default", user: AuthenticatedUser = Depen
 
 @app.get("/dashboard/stats")
 def dashboard_stats(user: AuthenticatedUser = Depends(get_current_user)):
-    """Returns real row counts from the database for the frontend home dashboard."""
+    """Returns real row counts from the database for the dashboard stats API."""
     refresh_validator_cache()
     conn = _pool.getconn()
     stats = {
@@ -1728,20 +1699,12 @@ async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = 
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # Smart auto-chart: picks type by result shape instead of the old
-    # "only 2 columns" rule.
     rows = result["rows"]
-    chart_json, chart_kind, single_stat = build_chart(rows, title=req.question, question=req.question)
-
     latency_ms = round((time.perf_counter() - start) * 1000, 1)
     return ChatResponse(
         sql=result["sql"],
         rows=rows,
         answer=result["answer"],
-        chart_json=chart_json,
-        chart_kind=chart_kind,
-        single_stat=single_stat,
-        confidence=result["confidence"],
         model_used=result["model_used"],
         cached=False,
         attempts=result["attempts"],
@@ -1753,6 +1716,32 @@ async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = 
         followups=result.get("followups", []),
     )
 
+@app.post("/chat/json")
+@limiter.limit("10/minute")
+async def chat_json(request: Request, req: ChatRequest, user: AuthenticatedUser = Depends(get_current_user)):
+    """
+    Server 1 → Server 2 relay. Sends the question to the internal processing
+    server (port 8001) and returns its JSON response as-is — no streaming.
+    """
+    org_id = req.org_id
+    all_orgs = req.all_orgs
+    if REQUIRE_AUTH and user:
+        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
+        if not is_admin:
+            org_id = user.org_id
+            all_orgs = False
+
+    payload = {
+        "question": req.question,
+        "context": req.context.dict() if req.context else None,
+        "org_id": org_id,
+        "all_orgs": all_orgs,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post("http://127.0.0.1:8001/process", json=payload)
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
 
 @app.post("/chat/stream")
 @limiter.limit("10/minute")
@@ -1836,92 +1825,23 @@ async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[
     )
 
 
-@app.post("/report/pdf")
-@limiter.limit("10/minute")
-async def generate_pdf(request: Request, req: ReportRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    sql = req.sql.strip()
-    
-    # 1. Validation and security checks
-    errors = validate_sql(sql, _known_tables, _known_columns)
-    org_id = user.org_id if user else None
-    if REQUIRE_AUTH and org_id:
-        is_admin = ADMIN_API_KEY and org_id == ADMIN_API_KEY
-        if not is_admin:
-            security_errors = validate_org_security(sql, org_id, _known_columns)
-            errors.extend(security_errors)
-            
-    if errors:
-        raise HTTPException(400, "SQL rejected for PDF: " + "; ".join(errors))
-        
-    # 2. Re-execute the query directly on the DB to fetch the FULL dataset (up to 100k safety limit)
-    try:
-        conn = _pool.getconn()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql)
-                rows = [dict(r) for r in cur.fetchmany(100000)]
-        finally:
-            _pool.putconn(conn)
-    except Exception as e:
-        raise HTTPException(500, f"Failed to fetch complete data for PDF: {e}")
-        
-    # 3. Generate PDF using the complete dataset
-    try:
-        pdf_path = await mcp_host.generate_pdf(req.question, sql, rows)
-    except Exception as e:
-        raise HTTPException(500, f"PDF generation failed: {e}")
-        
-    return FileResponse(pdf_path, media_type="application/pdf", filename="report.pdf")
 
 
-# ── Feedback logging (👍/👎) ───────────────────────────────────────────────────
-class FeedbackRequest(BaseModel):
-    question: str
-    sql: str
-    rating: str  # "up" | "down"
-    model_used: Optional[str] = None
-    confidence: Optional[dict] = None
-
-FEEDBACK_LOG_PATH = os.getenv("FEEDBACK_LOG_PATH", "./feedback_log.jsonl")
-
-@app.post("/feedback")
-@limiter.limit("30/minute")
-async def submit_feedback(request: Request, req: FeedbackRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    """
-    Append-only feedback log (JSONL). Cheap to add, gives real signal on
-    where accuracy is actually failing instead of guessing from complaints.
-    """
-    if req.rating not in ("up", "down"):
-        raise HTTPException(400, "rating must be 'up' or 'down'")
-    entry = {
-        "timestamp": time.time(),
-        "question": req.question,
-        "sql": req.sql,
-        "rating": req.rating,
-        "model_used": req.model_used,
-        "confidence": req.confidence,
-    }
-    try:
-        with open(FEEDBACK_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-    except Exception as e:
-        raise HTTPException(500, f"Failed to log feedback: {e}")
-    return {"status": "ok"}
 
 
 # ── Editable / re-runnable SQL ────────────────────────────────────────────────
 class RunSqlRequest(BaseModel):
     sql: str
-    question: str = ""  # used for chart title + insights context, optional
+    question: str = ""  # used for insights context, optional
 
 @app.post("/run-sql")
 @limiter.limit("15/minute")
 async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser = Depends(get_current_user)):
     """
-    Lets the user edit the generated SQL in the UI and re-run it directly.
+    Lets the user edit the generated SQL and re-run it directly.
     Goes through the SAME validate_sql() security guards as the normal
     pipeline (SELECT/WITH only, no write/DDL keywords, no chained
-    statements) — editing the SQL doesn't bypass any of that.
+    statements).
     """
     refresh_validator_cache()
     sql = req.sql.strip()
@@ -1943,15 +1863,11 @@ async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser 
         raise HTTPException(400, f"Execution error: {e}")
 
     quick_stats = compute_quick_stats(rows)
-    chart_json, chart_kind, single_stat = build_chart(rows, title=req.question or "Query result", question=req.question)
 
     return {
         "sql": sql,
         "rows": rows,
         "insights": quick_stats,
-        "chart_json": chart_json,
-        "chart_kind": chart_kind,
-        "single_stat": single_stat,
         "row_count": len(rows),
     }
 

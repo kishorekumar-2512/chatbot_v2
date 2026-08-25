@@ -19,22 +19,12 @@ env/
 # ── Embeddings (rebuilt per-machine from their own DB) ───────────────────────
 embeddings/chroma_store/
 
-# ── User data & logs ────────────────────────────────────────────────────────
+# ── User data, keys & logs ───────────────────────────────────────────────────
 data/llm_keys.json
-feedback_log.jsonl
-reports/*.pdf
+data/llm_failures.jsonl
+*.lock
 *.dump
-enum_search_results.json
-final_search_report.json
-all_lookup_tables.json
-candidates_raw.json
-classified_buckets.json
-lookup_audit_results.json
-lookup_tables_data.json
-
-# ── Node / React frontend ──────────────────────────────────────────────────
-web/node_modules/
-web/dist/
+feedback_log.jsonl
 
 # ── IDE & OS ────────────────────────────────────────────────────────────────
 .vscode/

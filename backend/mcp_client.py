@@ -1,18 +1,13 @@
 """
 backend/mcp_client.py
 
-MCP HOST. This is what your FastAPI backend uses instead of calling the old
-direct Python functions (get_schema, run_query, make_pdf etc. as local calls).
-
+MCP HOST. Manages MCP server subprocess connections.
 Per the MCP spec, the host launches each MCP server as a subprocess and talks
-to it over stdio using JSON-RPC. This module wraps that into simple async
-Python functions so the rest of main.py doesn't need to know MCP details.
+to it over stdio using JSON-RPC.
 
-Three servers are launched on startup and kept alive for the life of the
-FastAPI process:
+Two servers are launched on startup and kept alive for the life of the FastAPI process:
   - database-mcp-server  (run_query, get_schema, list_tables)
   - schema-mcp-server     (search_tables, get_columns, get_relations)
-  - report-mcp-server     (generate_pdf, make_chart, export_csv)
 """
 
 import os
@@ -35,7 +30,7 @@ class RowList(list):
 
 class MCPHost:
     """
-    Manages all 3 MCP server subprocess connections.
+    Manages MCP server subprocess connections.
     Call `await host.start()` once at FastAPI startup, `await host.stop()` at shutdown.
     """
 
@@ -43,7 +38,6 @@ class MCPHost:
         self._stack: AsyncExitStack | None = None
         self.database_session: ClientSession | None = None
         self.schema_session: ClientSession | None = None
-        self.report_session: ClientSession | None = None
 
     async def start(self):
         self._stack = AsyncExitStack()
@@ -53,9 +47,6 @@ class MCPHost:
         )
         self.schema_session = await self._launch(
             os.path.join(BASE_DIR, "mcp_servers", "schema_server.py")
-        )
-        self.report_session = await self._launch(
-            os.path.join(BASE_DIR, "mcp_servers", "report_server.py")
         )
 
     async def _launch(self, script_path: str) -> ClientSession:
@@ -104,29 +95,6 @@ class MCPHost:
         result = await self.schema_session.call_tool("get_relations", {"table": table})
         data = json.loads(result.content[0].text)
         return data.get("relations", [])
-
-    async def generate_pdf(self, question: str, sql: str, rows: list[dict]) -> str:
-        result = await self.report_session.call_tool(
-            "generate_pdf", {"question": question, "sql": sql, "rows": rows}
-        )
-        data = json.loads(result.content[0].text)
-        return data.get("pdf_path", "")
-
-    async def make_chart(self, rows: list[dict], title: str = "Chart") -> str | None:
-        result = await self.report_session.call_tool("make_chart", {"rows": rows, "title": title})
-        text = result.content[0].text
-        try:
-            parsed = json.loads(text)
-            if "error" in parsed:
-                return None
-        except Exception:
-            pass
-        return text  # plotly JSON string
-
-    async def export_csv(self, rows: list[dict]) -> str:
-        result = await self.report_session.call_tool("export_csv", {"rows": rows})
-        data = json.loads(result.content[0].text)
-        return data.get("csv_path", "")
 
 
 # Module-level singleton — created on FastAPI startup, reused across requests

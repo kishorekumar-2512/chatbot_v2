@@ -9,14 +9,10 @@ psycopg2-binary==2.9.9
 
 # HTTP client (LLM API calls, Vision Agent)
 httpx>=0.27.0
-requests==2.32.2
 filelock>=3.15.4
 
-# Data processing & visualization
+# Data processing
 pandas==2.2.2
-plotly==5.22.0
-kaleido==0.2.1
-fpdf2==2.7.9
 
 # Semantic retrieval — Hybrid RAG (dense + sparse)
 sentence-transformers>=2.7.0
@@ -35,9 +31,3 @@ mcp==1.2.0
 # JWT authentication (production SSO)
 PyJWT>=2.8.0
 cryptography>=42.0.0
-
-# Markdown support (documentation export)
-markdown>=3.6
-
-# Legacy Streamlit UI (optional — only if using frontend/app.py)
-streamlit==1.35.0
