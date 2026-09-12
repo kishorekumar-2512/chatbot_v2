@@ -25,8 +25,6 @@ CONFIG_KEYS = {
     "OLLAMA_BASE_URL",
     "OLLAMA_MODEL",
     "OLLAMA_NUM_CTX",
-    "KEY_STORE_PATH",
-    "LLM_FAILURE_LOG_PATH",
     "LLM_CONFIG_FILE",
 }
 
@@ -48,8 +46,6 @@ class RuntimeConfigSnapshot:
     ollama_base_url: str
     ollama_model: str
     ollama_num_ctx: int
-    key_store_path: Path
-    failure_log_path: Path
     revision: str
 
     def chain(self) -> list[str]:
@@ -92,13 +88,6 @@ class RuntimeConfig:
 
     @staticmethod
     def _build_snapshot(values: dict[str, str], revision: str) -> RuntimeConfigSnapshot:
-        project_root = Path(__file__).resolve().parent.parent
-        key_store_path = Path(values.get("KEY_STORE_PATH", "./data/llm_keys.json"))
-        if not key_store_path.is_absolute():
-            key_store_path = project_root / key_store_path
-        failure_log_path = Path(values.get("LLM_FAILURE_LOG_PATH", "./data/llm_failures.jsonl"))
-        if not failure_log_path.is_absolute():
-            failure_log_path = project_root / failure_log_path
         try:
             ollama_num_ctx = int(values.get("OLLAMA_NUM_CTX", "8192"))
         except ValueError:
@@ -112,8 +101,6 @@ class RuntimeConfig:
             ollama_base_url=(_clean(values.get("OLLAMA_BASE_URL")) or DEFAULT_OLLAMA_BASE_URL).rstrip("/"),
             ollama_model=_clean(values.get("OLLAMA_MODEL")) or DEFAULT_OLLAMA_MODEL,
             ollama_num_ctx=ollama_num_ctx,
-            key_store_path=key_store_path,
-            failure_log_path=failure_log_path,
             revision=revision,
         )
 
@@ -140,7 +127,7 @@ def format_all_models_failed_error(last_error: Optional[Exception | str] = None)
     if "rate_limit" in error_text:
         message = "The available LLM providers are temporarily rate-limited. Please wait a minute and try again."
     else:
-        message = "No LLM could answer this query. Configure a tenant BYO key or a system provider."
+        message = "No LLM could answer this query. Check that API keys are configured in your .env file."
     if last_error:
         message += f" Last error: {str(last_error).strip()}"
     return message + f" System chain: {' -> '.join(status['fallback_chain'])}."

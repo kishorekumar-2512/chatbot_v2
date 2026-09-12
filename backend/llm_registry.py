@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 
-ProviderStyle = Literal["openai", "anthropic", "gemini", "ollama"]
+ProviderStyle = Literal["openai", "gemini", "ollama"]
 
 
 @dataclass(frozen=True)
@@ -24,30 +24,6 @@ class ProviderDefinition:
 
 
 PROVIDERS: dict[str, ProviderDefinition] = {
-    "openai": ProviderDefinition(
-        provider="openai",
-        display_name="OpenAI",
-        style="openai",
-        models=("gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"),
-        capabilities=frozenset({"chat"}),
-        endpoint="https://api.openai.com/v1/chat/completions",
-    ),
-    "anthropic": ProviderDefinition(
-        provider="anthropic",
-        display_name="Anthropic (Claude)",
-        style="anthropic",
-        models=("claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"),
-        capabilities=frozenset({"chat"}),
-        endpoint="https://api.anthropic.com/v1/messages",
-    ),
-    "deepseek": ProviderDefinition(
-        provider="deepseek",
-        display_name="DeepSeek",
-        style="openai",
-        models=("deepseek-chat", "deepseek-coder", "deepseek-reasoner"),
-        capabilities=frozenset({"chat"}),
-        endpoint="https://api.deepseek.com/chat/completions",
-    ),
     "groq": ProviderDefinition(
         provider="groq",
         display_name="Groq",

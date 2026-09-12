@@ -19,9 +19,7 @@ env/
 # ── Embeddings (rebuilt per-machine from their own DB) ───────────────────────
 embeddings/chroma_store/
 
-# ── User data, keys & logs ───────────────────────────────────────────────────
-data/llm_keys.json
-data/llm_failures.jsonl
+# ── Runtime logs ─────────────────────────────────────────────────────────────
 *.lock
 *.dump
 feedback_log.jsonl

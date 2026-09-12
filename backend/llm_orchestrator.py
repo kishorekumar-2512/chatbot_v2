@@ -1,30 +1,24 @@
-"""Single request-scoped LLM routing, retry, breaker, and failure-log path."""
+"""Single request-scoped LLM routing, retry, and breaker path."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
-import os
 import random
 import re
 import threading
 import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Literal, Optional
 
 import httpx
-from filelock import FileLock
 
 from backend.llm_config import RuntimeConfigSnapshot, runtime_config
-from backend.llm_key_store import get_active_credentials
 from backend.llm_registry import PROVIDERS, ProviderDefinition, get_provider
 
 
-CredentialSource = Literal["byo", "system"]
+CredentialSource = Literal["system"]
 
 
 @dataclass(frozen=True)
@@ -169,17 +163,6 @@ class RetryPolicy:
         return min(2.0, (2 ** (attempt - 1)) + random.uniform(0, 0.25))
 
 
-class PersistentFailureLog:
-    def write(self, path: Path, event: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(path.with_suffix(path.suffix + ".lock")), timeout=10)
-        payload = {"timestamp": datetime.now(timezone.utc).isoformat(), **event}
-        with lock:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, sort_keys=True) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-
 
 class ProviderGateway:
     async def invoke(
@@ -207,7 +190,10 @@ class ProviderGateway:
     @staticmethod
     def _timeout_for(style: str, has_image: bool) -> httpx.Timeout:
         if style == "ollama":
-            return httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+            # Local 7B models can take longer than 30 seconds to produce the
+            # 700-1000 tokens allowed for SQL generation.  A short timeout
+            # incorrectly marks a healthy Ollama fallback as unavailable.
+            return httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=30.0)
         read_timeout = 120.0 if has_image else 60.0
         return httpx.Timeout(connect=10.0, read=read_timeout, write=30.0, pool=30.0)
 
@@ -226,12 +212,6 @@ class ProviderGateway:
                 credential.endpoint,
                 headers={"Authorization": f"Bearer {credential.secret}", "Content-Type": "application/json"},
                 json={"model": identity.model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.1},
-            )
-        if definition.style == "anthropic":
-            return await client.post(
-                credential.endpoint,
-                headers={"x-api-key": credential.secret or "", "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                json={"model": identity.model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
             )
         if definition.style == "gemini":
             parts = [{"text": prompt}]
@@ -257,9 +237,7 @@ class ProviderGateway:
     def _parse_response(style: str, response: httpx.Response) -> str:
         try:
             data = response.json()
-            if style == "anthropic":
-                text = data["content"][0]["text"]
-            elif style == "gemini":
+            if style == "gemini":
                 parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
                 text_parts = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
                 text = "".join(text_parts)
@@ -295,41 +273,9 @@ class ProviderGateway:
 
 
 class CredentialResolver:
-    _byo_priority = ("openai", "anthropic", "deepseek", "groq", "gemini", "ollama")
-
     def resolve(self, tenant_id: str | None, capability: str, snapshot: RuntimeConfigSnapshot) -> list[ResolvedCredential]:
         normalized_tenant = (tenant_id or "").strip() or "unscoped"
-        candidates = self._byo_candidates(normalized_tenant, capability, snapshot)
-        candidates.extend(self._system_candidates(normalized_tenant, capability, snapshot))
-        return candidates
-
-    def _byo_candidates(
-        self,
-        tenant_id: str,
-        capability: str,
-        snapshot: RuntimeConfigSnapshot,
-    ) -> list[ResolvedCredential]:
-        if tenant_id == "unscoped":
-            return []
-        credentials = {credential.provider: credential for credential in get_active_credentials(tenant_id)}
-        candidates = []
-        for provider in self._byo_priority:
-            credential = credentials.get(provider)
-            if not credential:
-                continue
-            definition = get_provider(provider)
-            if capability not in definition.capabilities:
-                continue
-            endpoint = credential.api_key.rstrip("/") if provider == "ollama" else definition.endpoint
-            secret = None if provider == "ollama" else credential.api_key
-            candidates.append(ResolvedCredential(
-                identity=CredentialIdentity(tenant_id, "byo", provider, credential.key_reference, credential.model),
-                secret=secret,
-                endpoint=endpoint,
-                provider_definition=definition,
-                ollama_num_ctx=snapshot.ollama_num_ctx if provider == "ollama" else None,
-            ))
-        return candidates
+        return self._system_candidates(normalized_tenant, capability, snapshot)
 
     def _system_candidates(self, tenant_id: str, capability: str, snapshot: RuntimeConfigSnapshot) -> list[ResolvedCredential]:
         providers = ["gemini"] if capability == "vision" else snapshot.chain()
@@ -368,7 +314,6 @@ class LLMOrchestrator:
         self._resolver = CredentialResolver()
         self._gateway = ProviderGateway()
         self._breakers = CredentialBreakerStore()
-        self._failure_log = PersistentFailureLog()
 
     async def generate(
         self,
@@ -378,67 +323,32 @@ class LLMOrchestrator:
         max_tokens: int = 400,
         capability: str = "chat",
         image: tuple[str, str] | None = None,
-    ) -> tuple[str, str]:
+        excluded_providers: set[str] | None = None,
+    ) -> tuple[str, str, str]:
         snapshot = runtime_config.snapshot()
-        request_id = uuid.uuid4().hex
         candidates = self._resolver.resolve(tenant_id, capability, snapshot)
+        excluded = {provider.strip().lower() for provider in (excluded_providers or set())}
+        candidates = [
+            credential for credential in candidates
+            if credential.identity.provider not in excluded
+        ]
         if not candidates:
+            if excluded:
+                raise AllProvidersFailed("No untried provider is configured for this correction attempt.")
             raise AllProvidersFailed("No configured credential supports this request.")
         errors: list[str] = []
         for credential in candidates:
             if not self._breakers.allow(credential.identity):
                 errors.append(f"{credential.identity.source}:{credential.identity.provider}:breaker_open")
-                self._log_failure(snapshot, request_id, credential.identity, capability, "breaker_open", None, 0, "skipped")
                 continue
             try:
                 text, attempts = await self._invoke_with_retry(credential, prompt, max_tokens, image)
                 self._breakers.record_success(credential.identity)
-                return text, self._label(credential.identity)
+                return text, self._label(credential.identity), credential.identity.provider
             except ProviderCallError as error:
-                state = self._breakers.record_failure(credential.identity, error)
-                action = "blocked" if state.blocked else "opened" if state.open_until > time.monotonic() else "fallback"
-                self._log_failure(snapshot, request_id, credential.identity, capability, error.error_type, error.status_code, getattr(error, "attempts", 1), action)
+                self._breakers.record_failure(credential.identity, error)
                 errors.append(f"{credential.identity.source}:{credential.identity.provider}:{error.error_type}")
         raise AllProvidersFailed("All LLM candidates failed: " + ", ".join(errors))
-
-    async def validate_key(self, provider: str, api_key: str, model: str = "") -> dict:
-        provider = provider.strip().lower()
-        if provider not in PROVIDERS:
-            return {"valid": False, "error": f"Unknown provider: {provider}"}
-        api_key = (api_key or "").strip()
-        if provider != "ollama" and not api_key:
-            return {"valid": False, "error": "API key is required"}
-        definition = get_provider(provider)
-        model = (model or "").strip() or definition.default_model
-        endpoint = api_key.rstrip("/") if provider == "ollama" else definition.endpoint
-        secret = None if provider == "ollama" else api_key
-        fingerprint = hashlib.sha256((api_key or endpoint).encode()).hexdigest()[:16]
-        snapshot = runtime_config.snapshot()
-        credential = ResolvedCredential(
-            identity=CredentialIdentity("validation", "byo", provider, f"validation:{provider}:{fingerprint}", model),
-            secret=secret,
-            endpoint=endpoint,
-            provider_definition=definition,
-            ollama_num_ctx=snapshot.ollama_num_ctx if provider == "ollama" else None,
-        )
-        request_id = uuid.uuid4().hex
-        try:
-            await self._invoke_with_retry(credential, "Reply with the single word: OK", 200, None)
-            return {"valid": True}
-        except ProviderCallError as error:
-            self._log_failure(
-                snapshot,
-                request_id,
-                credential.identity,
-                "validation",
-                error.error_type,
-                error.status_code,
-                getattr(error, "attempts", 1),
-                "validation",
-            )
-            if error.error_type == "auth":
-                return {"valid": False, "error": f"Invalid API key (HTTP {error.status_code})."}
-            return {"valid": False, "error": self._friendly_error(error)}
 
     async def analyze_dashboard(self, image_b64: str, tenant_id: str | None) -> list[dict]:
         mime_type, image_data = self._split_image(image_b64)
@@ -447,7 +357,7 @@ class LLMOrchestrator:
             "For EACH chart, output exactly:\n--- CHART N ---\nType: <chart type>\nData: <data requirements>\n\n"
             "Number charts from 1 and list data requirements, not styling details."
         )
-        raw, _ = await self.generate(
+        raw, _, _ = await self.generate(
             prompt,
             tenant_id=tenant_id,
             max_tokens=700,
@@ -483,8 +393,7 @@ class LLMOrchestrator:
 
     @staticmethod
     def _label(identity: CredentialIdentity) -> str:
-        source = "BYO" if identity.source == "byo" else "System"
-        return f"{source} {get_provider(identity.provider).display_name} ({identity.model})"
+        return f"{get_provider(identity.provider).display_name} ({identity.model})"
 
     @staticmethod
     def _friendly_error(error: ProviderCallError) -> str:
@@ -499,35 +408,6 @@ class LLMOrchestrator:
         if error.error_type == "malformed_response":
             return "Provider returned an invalid response."
         return "Provider request failed."
-
-    def _log_failure(
-        self,
-        snapshot: RuntimeConfigSnapshot,
-        request_id: str,
-        identity: CredentialIdentity,
-        capability: str,
-        error_type: str,
-        status_code: int | None,
-        attempts: int,
-        breaker_action: str,
-    ) -> None:
-        try:
-            self._failure_log.write(snapshot.failure_log_path, {
-                "request_id": request_id,
-                "tenant_id": identity.tenant_id,
-                "source": identity.source,
-                "provider": identity.provider,
-                "key_reference": identity.key_reference,
-                "model": identity.model,
-                "capability": capability,
-                "lifecycle_stage": "api_call",
-                "error_type": error_type,
-                "http_status": status_code,
-                "attempts": attempts,
-                "breaker_action": breaker_action,
-            })
-        except Exception:
-            pass
 
     @staticmethod
     def _split_image(image_b64: str) -> tuple[str, str]:

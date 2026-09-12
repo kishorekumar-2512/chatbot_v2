@@ -1,36 +1,30 @@
 """
-backend/main.py — Maximum accuracy version.
+backend/main.py — Single-server Text-to-SQL API with Multi-Turn Context & Org Isolation.
 
-6-layer accuracy pipeline:
+Pipeline:
   L1: Query Intelligence  — intent + entity extraction + SQL skeleton
   L2: Hybrid Retrieval    — BM25 + ChromaDB + anchor table injection  
   L3: Schema Graph        — FK-aware join path injection
-  L4: Context Assembly    — column value sampling + dynamic few-shot examples
+  L4: Context Assembly    — column value sampling + dynamic few-shot examples + multi-turn context
   L5: SQL Generation      — chain-of-thought prompt + circuit breaker LLMs
-  L6: Self Correction     — retry with diff context + zero-row diagnosis + sanity check
+  L6: Self Correction     — retry with diff context + sanity check
 """
-import threading
-import httpx
-import uvicorn
-import os, re, time, json, asyncio
+import os, re
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import psycopg2, psycopg2.extras, psycopg2.pool
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header, Depends
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Depends
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from backend.sql_validator import extract_sql, validate_sql, validate_org_security
-from backend.mcp_client import host as mcp_host
-from backend.schema_graph import get_join_hints, force_anchor_tables, expand_related_tables
+from backend.schema_graph import get_join_hints, force_anchor_tables, expand_related_tables, SCHEMA_GRAPH, ANCHOR_TABLES
 from backend.query_intelligence import build_query_context, extract_entities
 from backend.prompts import get_system_prompt
 
@@ -39,7 +33,7 @@ from backend.prompts import get_system_prompt
 try:
     from backend.hybrid_retriever import (
         retrieve_tables, get_similar_examples,
-        store_successful_example, build_value_hints, get_schema_for_tables,
+        store_successful_example, get_schema_for_tables,
     )
     from embeddings.retrieve import is_index_ready
     _HAS_EMBEDDINGS = True
@@ -49,113 +43,52 @@ except ImportError:
     def retrieve_tables(*a, **kw): return {"tables_used": [], "similarity_scores": {}, "schema_text": ""}
     def get_similar_examples(*a, **kw): return ""
     def store_successful_example(*a, **kw): pass
-    async def build_value_hints(*a, **kw): return ""
     def get_schema_for_tables(*a, **kw): return ""
 
-from backend.llm_key_store import (
-    save_key, get_all_keys, delete_key, toggle_key, key_store_status,
-)
 from backend.llm_orchestrator import AllProvidersFailed, orchestrator as llm_orchestrator
-from backend.llm_registry import PROVIDERS, provider_catalog
 from backend.llm_config import system_llm_status, format_all_models_failed_error
-from backend.self_correction import (
-    build_retry_context, diagnose_zero_rows,
-    sanity_check, generate_answer, check_sql_quality, try_auto_repair,
-)
-from backend.insights import compute_quick_stats, generate_followups
+from backend.self_correction import build_retry_context, check_sql_quality
 from backend.auth import get_current_user, AuthenticatedUser, REQUIRE_AUTH
 
-# load_dotenv() - already called at the top
-
-DATABASE_URL    = os.getenv("DATABASE_URL")
 MAX_ATTEMPTS    = 3
 
 
-async def _generate_llm(prompt: str, tenant_id: str | None, max_tokens: int = 400) -> tuple[str, str]:
-    return await llm_orchestrator.generate(prompt, tenant_id=tenant_id, max_tokens=max_tokens)
+async def _generate_llm(
+    prompt: str,
+    tenant_id: str | None,
+    max_tokens: int = 400,
+    excluded_providers: set[str] | None = None,
+) -> tuple[str, str, str]:
+    return await llm_orchestrator.generate(
+        prompt,
+        tenant_id=tenant_id,
+        max_tokens=max_tokens,
+        excluded_providers=excluded_providers,
+    )
 
-# ── DB pool for schema validator cache ────────────────────────────────────────
-_pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
-_known_tables: set = set()
+# ── Schema validator cache (derived from schema graph, no DB connection) ──────
+def _get_all_known_tables() -> set:
+    tables = set(SCHEMA_GRAPH.keys())
+    for parents in SCHEMA_GRAPH.values():
+        tables.update(parents.keys())
+    tables.update(ANCHOR_TABLES.keys())
+    return tables
+
+_known_tables: set = _get_all_known_tables()
 _known_columns: dict = {}
-_cache_at: float = 0.0
-SCHEMA_TTL = 300
 
 
 def refresh_validator_cache():
-    global _known_tables, _known_columns, _cache_at
-    now = time.time()
-    if _known_tables and now - _cache_at < SCHEMA_TTL:
-        return
-    conn = _pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT c.table_name, c.column_name 
-                FROM information_schema.columns c
-                JOIN information_schema.tables t ON c.table_name = t.table_name
-                WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
-                ORDER BY c.table_name, c.ordinal_position
-            """)
-            col_map = {}
-            tables = set()
-            for row in cur.fetchall():
-                t = row["table_name"]
-                c = row["column_name"]
-                tables.add(t)
-                if t not in col_map:
-                    col_map[t] = []
-                col_map[t].append(c)
-                
-        _known_tables = tables
-        _known_columns = col_map
-        _cache_at = now
-    finally:
-        _pool.putconn(conn)
-
-
-# ── Periodic auto-reindex ─────────────────────────────────────────────────────
-# Runs the same incremental sync as POST /admin/reindex, on a timer, so the
-# embedding index stays current against a cloud DB without anyone needing to
-# trigger it by hand. Failures here are caught and logged only — they must
-# never crash the app or affect the normal chat pipeline ("continues normal").
-REINDEX_INTERVAL_HOURS = float(os.getenv("REINDEX_INTERVAL_HOURS", "24"))  # 0 disables it
-_scheduler_task = None
-
-
-async def _periodic_reindex_loop():
-    if REINDEX_INTERVAL_HOURS <= 0:
-        print("[periodic reindex] disabled (REINDEX_INTERVAL_HOURS=0)")
-        return
-    print(f"[periodic reindex] enabled — running every {REINDEX_INTERVAL_HOURS}h")
-    while True:
-        try:
-            await asyncio.sleep(REINDEX_INTERVAL_HOURS * 3600)
-            print("[periodic reindex] starting scheduled incremental sync...")
-            await asyncio.to_thread(_run_reindex, False)  # incremental — cheap, safe to run often
-            print(f"[periodic reindex] done: {_reindex_status.get('last_result')}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            # Never let a scheduling/introspection failure take the app down —
-            # log it and try again on the next interval.
-            print(f"[periodic reindex] failed (will retry next interval): {e}")
+    global _known_tables
+    if not _known_tables or "managed_device" not in _known_tables:
+        _known_tables = _get_all_known_tables()
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler_task
     refresh_validator_cache()
-    fetch_rich_descriptions()
-    await mcp_host.start()
-    _scheduler_task = asyncio.create_task(_periodic_reindex_loop())
-    server2_task = asyncio.create_task(_start_server2())
     yield
-    if _scheduler_task:
-        _scheduler_task.cancel()
-    server2_task.cancel()
-    await mcp_host.stop()
 
 
 # ── App + security ────────────────────────────────────────────────────────────
@@ -164,291 +97,8 @@ app = FastAPI(title="AI Database Report Chatbot — Max Accuracy", lifespan=life
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ── Rich descriptions from PostgreSQL comments ───────────────────────────────
-TABLE_DESCRIPTIONS: dict = {}
-COLUMN_DESCRIPTIONS: dict = {}
 
-def fetch_rich_descriptions():
-    """Fetch table and column comments from PostgreSQL pg_catalog."""
-    global TABLE_DESCRIPTIONS, COLUMN_DESCRIPTIONS
-    conn = _pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # 1. Fetch table comments
-            cur.execute("""
-                SELECT c.relname AS table_name,
-                       d.description
-                FROM pg_catalog.pg_description d
-                JOIN pg_catalog.pg_class c ON d.objoid = c.oid
-                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-                WHERE n.nspname = 'public' AND d.objsubid = 0
-                ORDER BY c.relname
-            """)
-            TABLE_DESCRIPTIONS = {row["table_name"]: row["description"] for row in cur.fetchall()}
-
-            # 2. Fetch column comments
-            cur.execute("""
-                SELECT c.relname AS table_name,
-                       a.attname AS column_name,
-                       d.description
-                FROM pg_catalog.pg_description d
-                JOIN pg_catalog.pg_class c ON d.objoid = c.oid
-                JOIN pg_catalog.pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum
-                JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
-                WHERE n.nspname = 'public' AND d.objsubid > 0
-            """)
-            COLUMN_DESCRIPTIONS = {}
-            for row in cur.fetchall():
-                t = row["table_name"]
-                col = row["column_name"]
-                desc = row["description"]
-                if t not in COLUMN_DESCRIPTIONS:
-                    COLUMN_DESCRIPTIONS[t] = {}
-                COLUMN_DESCRIPTIONS[t][col] = desc
-    except Exception:
-        TABLE_DESCRIPTIONS = {}
-        COLUMN_DESCRIPTIONS = {}
-    finally:
-        _pool.putconn(conn)
-
-
-# ── Chain-of-Thought system prompt ────────────────────────────────────────────
-COT_SYSTEM_PROMPT = """You are a senior PostgreSQL analyst for an IT management platform (intern_db) with {num_tables} tables.
-Core tables: managed_device, managed_user, customer, device_info, agent_info, software,
-software_version_managed_device, license_details, org_patch, device_patch, alerts, zecure_group, policy.
-
-Before writing SQL, think step by step inside <think> tags. Keep each step to
-ONE short line — this is a quick planning scratchpad, not an essay:
-<think>
-TABLES: (which tables, from the schema provided)
-JOINS: (join path — note bigint IDs and junction tables)
-FILTER: (WHERE conditions; note boolean vs integer vs text columns)
-TYPE: (COUNT / LIST / AGGREGATE / TOP_N / TREND / COMPARISON)
-</think>
-
-Then write the SQL in ```sql ... ``` block.
-After the closing ```, write ONE clear business-language sentence (no SQL terms).
-
-════════════════════════════════════════
-HARD RULES — violation means the SQL is WRONG:
-════════════════════════════════════════
-
-1. ONLY SELECT statements. Never INSERT/UPDATE/DELETE/DROP.
-2. Always alias tables in JOINs (e.g. managed_device md).
-3. For ALL text/string searches use ILIKE '%value%'. NEVER use = 'value' for text.
-4. NEVER SELECT * — always name the specific columns needed.
-5. Use DISTINCT when joining 1-to-many to avoid row duplication.
-6. Use COUNT(DISTINCT pk) instead of COUNT(*) when joining multiple tables.
-7. Always add ORDER BY for readability.
-8. If using SELECT DISTINCT, every column in ORDER BY MUST also appear in
-   the SELECT list — Postgres will reject it otherwise.
-9. Non-aggregated SELECT columns MUST appear in GROUP BY.
-10. Use NULLIF(denominator, 0) to avoid division by zero.
-
-════════════════════════════════════════
-INTEGER-CODED COLUMNS (NEVER use ILIKE on these):
-════════════════════════════════════════
-
-managed_device.platform (INTEGER):
-  1 = Windows,  2 = macOS,  3 = Linux
-  ✅ md.platform = 1   (for Windows)
-  ❌ md.platform ILIKE '%windows%'   ← WILL FAIL
-
-managed_device.status (INTEGER):
-  1 = active,  2 = inactive
-  ✅ md.status = 1   (for active)
-  ❌ md.status ILIKE '%active%'   ← WILL FAIL
-
-Always check the schema data_type before using ILIKE — only use it on
-character varying / text columns.
-
-════════════════════════════════════════
-BOOLEAN COLUMNS (use = true / = false WITHOUT quotes):
-════════════════════════════════════════
-
-For: agent_status, is_active, is_encrypted, is_enabled, is_administrator,
-is_disabled, is_locked_out, tpmowned, auto_renew, approved, is_mandatory,
-reboot_required, is_default, restrict_uninstall, tracking_enabled,
-is_self_signed_certificate, status (when boolean)
-
-  ✅ ai.agent_status = true
-  ❌ ai.agent_status = 'true'
-
-════════════════════════════════════════
-SUPERLATIVE PATTERNS (latest, oldest, most, not latest):
-════════════════════════════════════════
-
-"latest" / "newest"  → MAX(col) or ORDER BY col DESC LIMIT 1
-"oldest" / "earliest" → MIN(col) or ORDER BY col ASC LIMIT 1
-"not latest" / "outdated" → WHERE col != (SELECT MAX(col) FROM same_table)
-"most" / "highest"   → ORDER BY metric DESC LIMIT N
-"least" / "lowest"   → ORDER BY metric ASC LIMIT N
-"without X" / "missing X" → LEFT JOIN ... WHERE right.id IS NULL
-                          or WHERE id NOT IN (SELECT ... FROM ...)
-
-════════════════════════════════════════
-DATE / TIME PATTERNS:
-════════════════════════════════════════
-
-"today"       → WHERE col::date = CURRENT_DATE
-"yesterday"   → WHERE col::date = CURRENT_DATE - 1
-"this week"   → WHERE col >= date_trunc('week', CURRENT_DATE)
-"last N days" → WHERE col >= CURRENT_DATE - INTERVAL 'N days'
-"this month"  → WHERE col >= date_trunc('month', CURRENT_DATE)
-"last N months" → WHERE col >= CURRENT_DATE - INTERVAL 'N months'
-Monthly trend → DATE_TRUNC('month', col)::date AS month
-
-════════════════════════════════════════
-CORE JOIN PATHS:
-════════════════════════════════════════
-
-managed_device → device_info           ON device_info.managed_device_id = managed_device.id
-managed_device → agent_info            ON agent_info.managed_device_id = managed_device.id
-managed_device → managed_user          ON managed_device.customer_id = managed_user.customer_id
-managed_device → device_operating_system_info ON device_operating_system_info.managed_device_id = managed_device.id
-managed_device → device_network_map    ON device_network_map.managed_device_id = managed_device.id
-managed_device → device_antivirus      ON device_antivirus.managed_device_id = managed_device.id
-managed_device → device_bitlocker      ON device_bitlocker.managed_device_id = managed_device.id
-managed_device → device_certificate    ON device_certificate.managed_device_id = managed_device.id
-managed_device → alerts                ON alerts.managed_device_id = managed_device.id
-managed_device → device_missing_patch  ON device_missing_patch.managed_device_id = managed_device.id
-managed_device → device_installed_patch ON device_installed_patch.managed_device_id = managed_device.id
-device_missing_patch/installed_patch → org_patch ON org_patch.patch_id = patch.patch_id
-software → software_version           ON software_version.software_id = software.id
-software_version → software_version_managed_device ON svmd.software_version_id = sv.id
-managed_user → user_logon_history      ON user_logon_history.managed_user_id = managed_user.id
-managed_user → managed_user_account_info ON managed_user_account_info.managed_user_id = managed_user.id
-
-════════════════════════════════════════
-FEW-SHOT EXAMPLES (real schema):
-════════════════════════════════════════
-
-Q: which devices have Intel i7 processor
-```sql
-SELECT DISTINCT md.device_name, di.processor
-FROM managed_device md
-JOIN device_info di ON di.managed_device_id = md.id
-WHERE di.processor ILIKE '%i7%';
-```
-Devices whose processor information contains Intel i7.
-
-Q: count windows devices
-```sql
-SELECT COUNT(DISTINCT md.id) AS windows_device_count
-FROM managed_device md
-WHERE md.platform = 1;
-```
-Total Windows devices (platform 1 = Windows).
-
-Q: list mac devices
-```sql
-SELECT DISTINCT md.device_name
-FROM managed_device md
-WHERE md.platform = 2;
-```
-All macOS devices (platform 2 = macOS).
-
-Q: show devices with inactive agents
-```sql
-SELECT md.device_name, ai.agent_version, ai.upgrade_status
-FROM managed_device md
-JOIN agent_info ai ON ai.managed_device_id = md.id
-WHERE ai.agent_status = false;
-```
-Devices where the monitoring agent is currently inactive.
-
-Q: devices NOT running the latest agent version
-```sql
-SELECT DISTINCT md.device_name, ai.agent_version
-FROM managed_device md
-JOIN agent_info ai ON ai.managed_device_id = md.id
-WHERE ai.agent_version != (SELECT MAX(agent_version) FROM agent_info);
-```
-Devices whose agent is not on the latest available version.
-
-Q: how many customers are there
-```sql
-SELECT COUNT(DISTINCT id) AS total_customers FROM customer;
-```
-Total number of customer accounts in the system.
-
-Q: top 10 most installed software
-```sql
-SELECT s.name, COUNT(svmd.id) AS install_count
-FROM software s
-JOIN software_version sv ON sv.software_id = s.id
-JOIN software_version_managed_device svmd ON svmd.software_version_id = sv.id
-GROUP BY s.name
-ORDER BY install_count DESC
-LIMIT 10;
-```
-The 10 most widely installed software titles across all devices.
-
-Q: devices with missing critical patches
-```sql
-SELECT DISTINCT md.device_name, op.title, op.severity
-FROM managed_device md
-JOIN device_missing_patch dmp ON dmp.managed_device_id = md.id
-JOIN org_patch op ON op.patch_id = dmp.patch_id
-WHERE op.severity ILIKE '%critical%';
-```
-Devices that are missing one or more critical-severity patches.
-
-Q: which users logged in today
-```sql
-SELECT DISTINCT mu.username, mu.email, ulh.logon_time
-FROM managed_user mu
-JOIN user_logon_history ulh ON ulh.managed_user_id = mu.id
-WHERE ulh.logon_time::date = CURRENT_DATE
-ORDER BY ulh.logon_time DESC;
-```
-Users who logged in today, with their most recent logon time.
-
-Q: alert count by severity
-```sql
-SELECT severity, COUNT(*) AS alert_count
-FROM alerts
-GROUP BY severity
-ORDER BY alert_count DESC;
-```
-Number of alerts grouped by severity level.
-
-Q: devices without antivirus
-```sql
-SELECT DISTINCT md.device_name
-FROM managed_device md
-LEFT JOIN device_antivirus da ON da.managed_device_id = md.id
-WHERE da.id IS NULL;
-```
-Devices that have no antivirus product registered.
-
-Q: OS distribution across all devices
-```sql
-SELECT doi.os_name, COUNT(DISTINCT md.id) AS device_count
-FROM managed_device md
-JOIN device_operating_system_info doi ON doi.managed_device_id = md.id
-GROUP BY doi.os_name
-ORDER BY device_count DESC;
-```
-Count of devices per operating system name.
-
-Q: patch compliance percentage per device
-```sql
-SELECT md.device_name,
-       dps.installed_count,
-       dps.missing_count,
-       ROUND(dps.installed_count * 100.0 / NULLIF(dps.installed_count + dps.missing_count, 0), 1) AS compliance_pct
-FROM managed_device md
-JOIN device_patch_summary dps ON dps.managed_device_id = md.id
-ORDER BY compliance_pct ASC;
-```
-Patch compliance percentage for each device, sorted worst to best.
-"""
-
-# Extra guidance only injected for questions that look like they need
-# multi-step logic (breakdowns, per-group rankings, trends, comparisons).
-# Kept separate from the base prompt so simple questions stay fast and lean —
-# only complex ones pay the extra token cost.
+# ── SQL hints & complexity heuristics ─────────────────────────────────────────
 ADVANCED_SQL_HINTS = """
 This looks like a more advanced analytical question. Extra tools available:
 - CTEs for multi-step logic: WITH step_name AS (SELECT ...) SELECT ... FROM step_name.
@@ -528,7 +178,27 @@ def is_followup_question(question: str) -> bool:
     return bool(_CONTINUATION_RE.search(question))
 
 
-def build_conversation_context_block(context: "ConversationContext | None", question: str) -> str:
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class ConversationContext(BaseModel):
+    question: str
+    sql: str
+    tables_used: list[str] = []
+
+
+class ChatRequest(BaseModel):
+    question: str
+    context: Optional[ConversationContext] = None
+    org_id: Optional[str] = None
+    image_base64: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    sql: str
+    model_used: str
+    attempts: int
+
+
+def build_conversation_context_block(context: Optional[ConversationContext], question: str) -> str:
     """
     Returns a short prompt block resolving pronouns/continuations against
     the previous turn, or "" if this doesn't look like a follow-up (or there
@@ -551,149 +221,7 @@ Do not blindly repeat the old SQL — adapt it to what's being asked now.
 """
 
 
-# ── Meta / schema-introspection bypass ───────────────────────────────────────
-# Questions like "list all tables", "what columns does X have", "show me the
-# schema" aren't data questions — they're questions about the schema itself,
-# which we already have fully cached in _known_tables / _known_columns. Two
-# real bugs came from routing these into the normal NL→SQL pipeline instead:
-#   1. The model correctly writes `SELECT table_name FROM information_schema
-#      .tables`, but the validator only knows the ~234 *business* tables, so
-#      it rejects `information_schema` as "unknown" and burns all 3 retries.
-#   2. For "every table's columns", the model has no way to express that as
-#      one query and hallucinates a chain of `SELECT * FROM a; SELECT * FROM
-#      b; ...`, which either errors or silently returns the wrong table's rows.
-# Answering these directly from the cache is both instant (no LLM call at
-# all) and always correct, since it's just reading the schema we already have.
-
-_META_ALL_COLUMNS_RE = re.compile(
-    r"\b(all|every)\s+column(s)?\s+(of|for|in)\s+(every|all)\s+table|"
-    r"\bfull\s+schema\b|\bentire\s+schema\b|\bwhole\s+schema\b", re.IGNORECASE
-)
-_META_LIST_TABLES_RE = re.compile(
-    r"\blist\s+(all\s+|the\s+)?tables\b|\bshow\s+(me\s+)?(all\s+|the\s+)?tables\b|"
-    r"\bwhat\s+tables\b|\bhow\s+many\s+tables\b|\ball\s+tables\b|"
-    r"\btables?\s+(are\s+)?(there|available|exist)\b|\bshow\s+(me\s+)?the\s+schema\b",
-    re.IGNORECASE
-)
-_META_DESCRIBE_TABLE_RE = re.compile(
-    r"\bcolumns?\s+(of|in|for)\s+(the\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b|"
-    r"\bdescribe\s+(the\s+)?(table\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b|"
-    r"\bwhat\s+columns?\s+does\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+have\b|"
-    r"\bstructure\s+of\s+(the\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\b",
-    re.IGNORECASE
-)
-
-
-def _find_known_table(candidate: str) -> str | None:
-    """Match a user-typed word against the real table names, case-insensitively,
-    allowing loose singular/plural and underscore-vs-space variants."""
-    if not candidate:
-        return None
-    cand = candidate.lower().strip()
-    for t in _known_tables:
-        if t.lower() == cand:
-            return t
-    norm = cand.replace(" ", "_")
-    for t in _known_tables:
-        tl = t.lower()
-        if tl == norm or tl == norm + "s" or tl + "s" == norm or tl.rstrip("s") == norm.rstrip("s"):
-            return t
-    return None
-
-
-def try_meta_query(question: str) -> dict | None:
-    """
-    Returns a fully-formed result dict (same shape as the normal pipeline's
-    final output) if `question` is a schema/meta question we can answer
-    straight from cache, else None (meaning: run the normal LLM pipeline).
-    """
-    q = question.strip()
-
-    if _META_ALL_COLUMNS_RE.search(q):
-        rows = [{"table_name": t, "column_count": len(_known_columns.get(t, []))} for t in sorted(_known_tables)]
-        answer = (
-            f"This database has **{len(_known_tables)} tables**. Here's each table with its column count "
-            f"(open the SQL panel below for the exact introspection query, or ask about a specific table "
-            f"to see its actual columns)."
-        )
-        return {
-            "sql": "SELECT table_name, COUNT(*) AS column_count FROM information_schema.columns "
-                   "WHERE table_schema='public' GROUP BY table_name ORDER BY table_name;",
-            "rows": rows, "answer": answer,
-            "model_used": "schema-cache (no LLM used)", "attempts": 1,
-            "tables_used": [],
-            "sql_warnings": [], "intent": "META",
-            "insights": [f"Tables: {len(_known_tables)}", f"Total columns across schema: {sum(len(c) for c in _known_columns.values())}"],
-            "followups": ["List all tables", "What columns does customer have?"],
-        }
-
-    if _META_LIST_TABLES_RE.search(q):
-        rows = [{"table_name": t} for t in sorted(_known_tables)]
-        answer = f"This database has **{len(_known_tables)} tables**."
-        return {
-            "sql": "SELECT table_name FROM information_schema.tables "
-                   "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name;",
-            "rows": rows, "answer": answer,
-            "model_used": "schema-cache (no LLM used)", "attempts": 1,
-            "tables_used": [],
-            "sql_warnings": [], "intent": "META",
-            "insights": [f"Tables: {len(_known_tables)}"],
-            "followups": ["Show all columns of every table", "What columns does customer have?"],
-        }
-
-    m = _META_DESCRIBE_TABLE_RE.search(q)
-    if m:
-        stopwords = {"the", "table", "of", "in", "for", "column", "columns"}
-        candidate = None
-        for g in m.groups():
-            if not g:
-                continue
-            gs = g.strip()
-            if gs.lower() in stopwords:
-                continue
-            if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", gs):
-                candidate = gs
-                break
-        table = _find_known_table(candidate) if candidate else None
-        if table:
-            cols = _known_columns.get(table, [])
-            rows = [{"column_name": c} for c in cols]
-            answer = f"The **{table}** table has **{len(cols)} columns**: {', '.join(cols)}."
-            return {
-                "sql": f"SELECT column_name FROM information_schema.columns "
-                       f"WHERE table_schema='public' AND table_name='{table}' ORDER BY ordinal_position;",
-                "rows": rows, "answer": answer,
-                "model_used": "schema-cache (no LLM used)", "attempts": 1,
-                "tables_used": [table],
-                "sql_warnings": [], "intent": "META",
-                "insights": [f"Columns: {len(cols)}"],
-                "followups": [f"Show me 5 rows from {table}", "List all tables"],
-            }
-        elif candidate:
-            close = [t for t in _known_tables if candidate.lower() in t.lower() or t.lower() in candidate.lower()]
-            hint = f" Did you mean: {', '.join(sorted(close)[:5])}?" if close else ""
-            return {
-                "sql": "", "rows": [],
-                "answer": f"I couldn't find a table called '{candidate}' in the schema.{hint}",
-                "model_used": "schema-cache (no LLM used)", "attempts": 1,
-                "tables_used": [],
-                "sql_warnings": [], "intent": "META",
-                "insights": [], "followups": ["List all tables"],
-            }
-
-    return None
-
-
 # ── Prompt size guard ─────────────────────────────────────────────────────────
-# Groq free tier allows only 12,000 tokens/min for llama-3.3-70b-versatile.
-# A single prompt with full schema can exceed this. This guard estimates
-# token count and progressively trims the schema DDL (removing the least
-# relevant tables last-to-first) until the prompt fits within budget.
-# The 70B model is preserved for accuracy — only the schema is trimmed.
-
-# Keep well below the shared Groq free-tier request budget.  The schema is
-# often much larger than the natural-language question, so a 7k-token prompt
-# can still be rejected with HTTP 413 before a model produces any output.
 _MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "3000"))
 
 
@@ -713,71 +241,48 @@ def _trim_prompt_to_budget(prompt: str, schema_text: str, tables_used: list[str]
     if total <= budget:
         return prompt, schema_text, tables_used
 
-    # Schemas arrive from both the MCP server and ChromaDB.  Some use blank
-    # lines between DDLs, while the retriever uses a single newline.  Splitting
-    # only on blank lines treats a complete schema as one block, so it never
-    # gets trimmed and Groq returns HTTP 413 for the oversized request.
     ddl_blocks = [b.strip() for b in re.split(
         r"\n\s*(?=(?:CREATE\s+TABLE|Table\s+[^\s(]+\s*\(|--\s*(?:Table|table)\s*[:(]))",
-        schema_text,
-        flags=re.IGNORECASE,
+        schema_text.strip(),
     ) if b.strip()]
+
     if len(ddl_blocks) <= 1:
-        ddl_blocks = [b.strip() for b in schema_text.split("\n\n") if b.strip()]
-    if len(ddl_blocks) <= 1:
+        lines = schema_text.strip().split("\n")
+        while len(lines) > 20 and _estimate_tokens(prompt) + max_tokens > budget:
+            lines = lines[:-10]
+            new_schema = "\n".join(lines)
+            prompt = prompt.replace(schema_text, new_schema)
+            schema_text = new_schema
         return prompt, schema_text, tables_used
 
-    # Remove the least relevant DDLs from the end until the whole request,
-    # including the expected completion, fits the configured budget.
-    original_schema = schema_text
-    original_prompt = prompt
-    trimmed_tables = list(tables_used)
-    candidate_prompt = prompt
-    while len(ddl_blocks) > 2:
-        candidate_schema = "\n\n".join(ddl_blocks)
-        candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
-        if _estimate_tokens(candidate_prompt) + max_tokens <= budget:
-            return candidate_prompt, candidate_schema, trimmed_tables
-        ddl_blocks.pop()
-        if trimmed_tables:
-            trimmed_tables.pop()
+    while ddl_blocks and _estimate_tokens(prompt) + max_tokens > budget:
+        removed_block = ddl_blocks.pop()
+        m = re.search(r"(?:CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?|Table\s+|--\s*Table\s*:\s*)([a-zA-Z0-9_]+)", removed_block, re.IGNORECASE)
+        if m:
+            removed_name = m.group(1).lower()
+            tables_used = [t for t in tables_used if t.lower() != removed_name]
 
-    # Two selected tables are enough for a valid JOIN but can still contain
-    # unusually wide DDLs.  Respect the hard budget rather than sending a
-    # request Groq will reject; the first table is the most relevant one.
-    candidate_schema = "\n\n".join(ddl_blocks)
-    candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
-    allowed_schema_chars = max(
-        0,
-        (budget - max_tokens - _estimate_tokens(original_prompt.replace(original_schema, "", 1))) * 4,
-    )
-    if len(candidate_schema) > allowed_schema_chars:
-        omission_notice = "\n-- remaining schema omitted to fit the model request limit"
-        content_chars = max(0, allowed_schema_chars - len(omission_notice))
-        candidate_schema = candidate_schema[:content_chars].rsplit("\n", 1)[0] + omission_notice
-        candidate_prompt = original_prompt.replace(original_schema, candidate_schema, 1)
-    return candidate_prompt, candidate_schema, trimmed_tables[:len(ddl_blocks)]
+    trimmed_schema = "\n\n".join(ddl_blocks)
+    prompt = prompt.replace(schema_text, trimmed_schema)
+    prompt = re.sub(r"Relevant Schema \(\d+ tables selected\):",
+                    f"Relevant Schema ({len(ddl_blocks)} tables selected):", prompt)
+    return prompt, trimmed_schema, tables_used
 
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
-async def generate_sql_with_retry(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False) -> dict:
+async def generate_sql_with_retry(
+    question: str,
+    context: Optional[ConversationContext] = None,
+    org_id: str | None = None,
+) -> dict:
     """
-    6-layer accuracy pipeline. Returns full result dict.
+    Pure Text-to-SQL generation pipeline with multi-turn context support and strict org_id isolation.
     """
     refresh_validator_cache()
-    start_total = time.perf_counter()
-
-    # ── L0: Meta/schema bypass — instant, deterministic, no LLM call ────────
-    meta_result = try_meta_query(question)
-    if meta_result is not None:
-        meta_result["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 1)
-        return meta_result
 
     # ── L1: Query Intelligence ───────────────────────────────────────────────
     qctx = build_query_context(question, "", "")  # schema_text filled later
 
-    # Complex questions (breakdowns, per-group rankings, trends, comparisons)
-    # get more candidate tables and more room for CTE/window-function SQL.
     complex_q = is_complex_query(question)
     retrieval_top_k = int(os.getenv("RETRIEVAL_TOP_K", "8")) + (4 if complex_q else 0)
     gen_max_tokens = 1000 if complex_q else 700
@@ -793,10 +298,7 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
         similarity_scores = retrieval["similarity_scores"]
         schema_text       = retrieval["schema_text"]
     else:
-        # Without the embedding index, do not send all 234 tables and later
-        # truncate arbitrary ones.  Start with the question's known entities
-        # and join connectors, so complex queries keep the complete path.
-        all_tables  = await mcp_host.list_tables()
+        all_tables = list(_known_tables)
         entity_tables = [
             table for table in extract_entities(question)["tables"]
             if table in all_tables
@@ -806,7 +308,7 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
         tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
         if not tables_used:
             tables_used = all_tables[:min(3, len(all_tables))]
-        schema_text = await mcp_host.get_schema(tables_used)
+        schema_text = ""
         similarity_scores = {}
 
     # Force anchor tables based on question keywords
@@ -814,9 +316,6 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
     if complex_q:
         tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
 
-    # Retrieval's raw schema only contains the initially returned tables.
-    # Fetch DDL for anchors and graph connectors added above, otherwise a
-    # complex query would receive a join hint but not the table columns.
     if index_ready:
         added_tables = [table for table in tables_used if table not in retrieved_tables]
         if added_tables:
@@ -834,53 +333,56 @@ async def generate_sql_with_retry(question: str, context: "ConversationContext |
             if extra_schema:
                 schema_text = schema_text + "\n" + extra_schema
                 tables_used = tables_used + new_tables
+        elif new_tables and not index_ready:
+            tables_used = tables_used + [t for t in new_tables if t in _known_tables]
 
     # ── L3: Schema Graph — compute join hints ────────────────────────────────
     join_hints = get_join_hints(tables_used)
 
     # ── L4: Context Assembly ─────────────────────────────────────────────────
-    # Dynamic few-shot: retrieve similar past successful queries
     past_examples = get_similar_examples(question, top_k=3)
-
-    # Column value sampling: actual DB values for filter columns
-    value_hints = await build_value_hints(tables_used, mcp_host.run_query)
-
-    # Rebuild query context now that we have schema and join hints
+    value_hints = ""
     qctx = build_query_context(question, schema_text, join_hints)
 
     # ── L5 + L6: Generation + Self-Correction loop ───────────────────────────
     failed_attempts: list[tuple[str, str]] = []
+    # A provider that returned SQL which fails validation has completed its API
+    # call successfully, so the normal provider-error fallback cannot see the
+    # failure. Exclude it on the next correction attempt to progress through
+    # Groq -> Gemini -> Ollama rather than repeatedly asking the same model.
+    rejected_providers: set[str] = set()
     model_used = "qwen"
     last_sql   = ""
-    validation_errors: list[str] = []
 
-    async def generate_for_request(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
-        return await _generate_llm(prompt, org_id, max_tokens)
+    async def generate_for_request(prompt: str, max_tokens: int = 400) -> tuple[str, str, str]:
+        return await _generate_llm(
+            prompt,
+            org_id,
+            max_tokens,
+            excluded_providers=rejected_providers,
+        )
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-
-        # Build the full prompt
         retry_ctx = build_retry_context(failed_attempts)
 
-        # all_orgs=True means an admin-key-verified cross-tenant request (see
-        # _check_admin_key() in the route handler — this function never checks
-        # the key itself, it trusts the caller already did). Otherwise, fall
-        # back to normal single-org filtering, or no filtering if org_id
-        # wasn't supplied at all.
-        if all_orgs:
-            org_hint = ("\nAUTHORIZED CROSS-ORGANIZATION QUERY: This request has been verified as an "
-                        "administrative query. Do NOT filter by zecure_org_id — return data across all "
-                        "organizations, unless the question itself asks to group or filter by organization.\n")
-        elif org_id:
-            org_hint = f"\nSECURITY RULE: ALWAYS filter by zecure_org_id = {org_id} on all tables that have this column.\n"
+        if org_id:
+            org_hint = f"""
+MANDATORY REQUIREMENT:
+The user specified org_id = {org_id}.
+EVERY SQL query generated MUST strictly include `zecure_org_id = {org_id}` in the WHERE clause (e.g., `WHERE alias.zecure_org_id = {org_id}` or `AND zecure_org_id = {org_id}`).
+For questions about tables or database schema (such as "how many tables are there"), write:
+```sql
+SELECT COUNT(DISTINCT table_name) AS total_table_count
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_type = 'BASE TABLE'
+  AND zecure_org_id = {org_id};
+```
+Always output pure SQL inside ```sql ... ``` code blocks. Do not output conversational explanations or excuses.
+"""
         else:
             org_hint = ""
 
-        # The legacy COT prompt alone consumes ~2,238 tokens.  With the
-        # request cap this left virtually no schema for the model, which made
-        # it guess joins, fail execution, and consume the Groq quota on a
-        # retry.  The maintained compact prompt leaves room for the relevant
-        # schema while retaining the SQL safety rules.
         system_prompt = get_system_prompt()
         prompt = f"""{system_prompt}
 {ADVANCED_SQL_HINTS if complex_q else ""}
@@ -906,24 +408,12 @@ Intent detected: {qctx['intent']} — {qctx['intent_hint']}
 Question: {question}
 """
 
-        # If the last two attempts failed with the SAME CLASS of error, a
-        # 3rd try on the same small local model is unlikely to help —
-        # escalate straight to the bigger fallback model instead of wasting
-        # another round-trip repeating the mistake.
-
-        # Try customer's own LLM key first (if configured)
-        # NOTE: bumped from 500 -> 700 (1000 for complex questions). The
-        # <think> step-by-step reasoning block eats a big chunk of the token
-        # budget on its own, and at 500 it was frequently cutting the SQL
-        # block off mid-query — a real contributor to both the retries
-        # (slowness) and the wrong-answer rate (accuracy) reported after
-        # this was added.
-        # Trim prompt to fit within Groq free tier token budget
+        # Trim prompt to fit within token budget
         prompt, schema_text, tables_used = _trim_prompt_to_budget(
             prompt, schema_text, tables_used, gen_max_tokens)
 
         try:
-            raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
+            raw, model_used, provider_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
         except AllProvidersFailed as e:
             raise ValueError(format_all_models_failed_error(e))
 
@@ -936,82 +426,32 @@ Question: {question}
         if not re.match(r"^\s*(SELECT|WITH)\b", sql, re.IGNORECASE):
             err = f"Non-SELECT SQL returned: {sql[:100]}"
             failed_attempts.append((sql, err))
+            rejected_providers.add(provider_used)
             continue
 
-        # Schema and security validation
+        # Schema and security validation (org_id isolation strictly enforced)
         validation_errors = validate_sql(sql, _known_tables, _known_columns)
-        if not all_orgs and org_id:
+        if org_id:
             security_errors = validate_org_security(sql, org_id, _known_columns)
             validation_errors.extend(security_errors)
             
         if validation_errors:
             err = "Validation errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)
             failed_attempts.append((sql, err))
+            rejected_providers.add(provider_used)
             continue
 
         # SQL quality warnings (logged, don't block)
-        warnings = check_sql_quality(sql)
+        check_sql_quality(sql)
 
-        # Execute
-        try:
-            rows = await mcp_host.run_query(sql)
-        except Exception as e:
-            error_str = str(e)
-            # Try a deterministic, LLM-free fix first for well-known
-            # mechanical errors (e.g. SELECT DISTINCT + ORDER BY mismatch) —
-            # faster and more reliable than hoping the model corrects itself
-            # from error text, especially for a small local model.
-            repaired_sql = try_auto_repair(sql, error_str)
-            if repaired_sql:
-                repair_errors = validate_sql(repaired_sql, _known_tables, _known_columns)
-                if not all_orgs and org_id:
-                    repair_errors.extend(validate_org_security(repaired_sql, org_id, _known_columns))
-                if not repair_errors:
-                    try:
-                        rows = await mcp_host.run_query(repaired_sql)
-                        sql = repaired_sql  # repair succeeded — use the patched query
-                    except Exception as e2:
-                        failed_attempts.append((sql, f"Execution error: {error_str}"))
-                        continue
-                else:
-                    failed_attempts.append((sql, f"Execution error: {error_str}"))
-                    continue
-            else:
-                failed_attempts.append((sql, f"Execution error: {error_str}"))
-                continue
-
-        # ── Zero-row diagnosis ───────────────────────────────────────────────
-        if len(rows) == 0 and attempt < MAX_ATTEMPTS:
-            fixed_sql = await diagnose_zero_rows(sql, generate_for_request)
-            if fixed_sql and fixed_sql != sql:
-                try:
-                    fixed_rows = await mcp_host.run_query(fixed_sql)
-                    if len(fixed_rows) > 0:
-                        sql  = fixed_sql
-                        rows = fixed_rows
-
-                except Exception:
-                    pass  # Keep original sql/rows
-
-        # ── Richer, data-grounded answer + interactive follow-ups ────────────
-        quick_stats = compute_quick_stats(rows)
-        answer = await generate_answer(question, rows, generate_for_request, quick_stats=quick_stats)
-        followups = generate_followups(question, rows, sql, qctx["intent"])
-
-        # ── Store successful example for future retrieval ─────────────────────
-        store_successful_example(question, sql, len(rows))
+        # SQL successfully generated and validated
+        store_successful_example(question, sql, 1)
 
         return {
             "sql":               sql,
-            "rows":              rows,
-            "answer":            answer,
             "model_used":        model_used,
             "attempts":          attempt,
             "tables_used":       tables_used,
-            "sql_warnings":      warnings,
-            "intent":            qctx["intent"],
-            "insights":          quick_stats,
-            "followups":         followups,
         }
 
     # All attempts exhausted
@@ -1021,953 +461,39 @@ Question: {question}
         f"Last error: {failed_attempts[-1][1] if failed_attempts else 'unknown'}"
     )
 
-class ConversationContext(BaseModel):
-    question: str
-    sql: str
-    tables_used: list[str] = []
-
-# ── SERVER 2 — Internal processing server (runs on port 8001) ────────────────
-server2 = FastAPI(title="chatbot_v2 — Processing Server")
-
-class Server2Request(BaseModel):
-    question: str
-    context: Optional["ConversationContext"] = None
-    org_id: Optional[str] = None
-    all_orgs: bool = False
-
-@server2.post("/process")
-async def server2_process(req: Server2Request):
-    result = await generate_sql_with_retry(
-        req.question, context=req.context, org_id=req.org_id, all_orgs=req.all_orgs
-    )
-    # Response trimmed to sql/model_used/attempts — full fields available internally,
-    # re-enable for frontend later
-    return {
-        "sql": result["sql"],
-        "model_used": result["model_used"],
-        "attempts": result["attempts"],
-    }
-
-
-_server2_instance: Optional["uvicorn.Server"] = None
-
-async def _start_server2():
-    global _server2_instance
-    config = uvicorn.Config(server2, host="127.0.0.1", port=8001, log_level="info")
-    _server2_instance = uvicorn.Server(config)
-    await _server2_instance.serve()
-
-# ── Streaming pipeline (powers /chat/stream — live progress + model thinking) ─
-async def generate_sql_streaming(question: str, context: "ConversationContext | None" = None, org_id: str | None = None, all_orgs: bool = False, image_base64: str | None = None):
-    """
-    Same 6-layer pipeline as generate_sql_with_retry, but implemented as an
-    async generator that yields JSON-able event dicts as it goes:
-
-      {"type": "status",  "stage": ..., "message": ...}   — progress updates
-      {"type": "thinking_token", "text": ..., "model": ...} — live model tokens
-      {"type": "final", "data": {...same shape as ChatResponse...}}
-      {"type": "error", "message": ...}
-
-    This is what lets the UI show what the model is actually generating
-    (the <think> reasoning + SQL) as it's produced, instead of one static
-    "generating…" message for the whole 3-5 minutes.
-    """
-    start_total = time.perf_counter()
-    refresh_validator_cache()
-
-    if image_base64:
-        yield {"type": "status", "stage": "vision", "message": "👁️ Analyzing uploaded image using Vision Agent..."}
-        try:
-            chart_descriptions = await llm_orchestrator.analyze_dashboard(image_base64, org_id)
-            num_charts = len(chart_descriptions)
-
-            if num_charts > 1:
-                # ── Multi-chart dashboard path ──────────────────────────────
-                yield {"type": "status", "stage": "vision",
-                       "message": f"📊 Dashboard detected: {num_charts} charts found. Generating queries for each..."}
-                multi_results = []
-                for cd in chart_descriptions:
-                    chart_q = f"{question}\n\n[Vision Agent — Chart {cd['chart_number']}]:\n" \
-                              f"Chart type requested: {cd['chart_type']}\n" \
-                              f"Data requirements: {cd['description']}"
-                    yield {"type": "status", "stage": "multi_chart",
-                           "message": f"🔄 Processing chart {cd['chart_number']}/{num_charts}: {cd['chart_type']}..."}
-                    try:
-                        single_result = None
-                        async for evt in generate_sql_streaming(chart_q, context, org_id, all_orgs, image_base64=None):
-                            if evt.get("type") == "final":
-                                single_result = evt["data"]
-                            elif evt.get("type") == "error":
-                                single_result = {"error": evt["message"], "chart_info": cd}
-                        if single_result:
-                            single_result["chart_info"] = cd
-                            multi_results.append(single_result)
-                    except Exception as e:
-                        multi_results.append({"error": str(e), "chart_info": cd})
-
-                yield {"type": "multi_final", "data": multi_results}
-                return
-            else:
-                # ── Single chart path (unchanged behavior) ──────────────────
-                cd = chart_descriptions[0]
-                chart_type_hint = f"\nChart type requested: {cd['chart_type']}" if cd['chart_type'] else ""
-                question = f"{question}\n\n[Vision Agent Analysis of uploaded image]:\n{cd['description']}{chart_type_hint}"
-
-        except Exception as e:
-            yield {"type": "status", "stage": "vision_error", "message": f"⚠️ Vision Agent failed: {e}. Falling back to text only."}
-
-    # ── L0: Meta/schema bypass — instant, deterministic, no LLM call ────────
-    meta_result = try_meta_query(question)
-    if meta_result is not None:
-        yield {"type": "status", "stage": "meta", "message": "📚 Answering directly from schema cache (no model needed)..."}
-        meta_result["latency_ms"] = round((time.perf_counter() - start_total) * 1000, 1)
-        yield {"type": "final", "data": meta_result}
-        return
-
-    yield {"type": "status", "stage": "retrieval",
-           "message": "🔍 Retrieving relevant tables (semantic + keyword search)..."}
-
-    qctx = build_query_context(question, "", "")
-    complex_q = is_complex_query(question)
-    retrieval_top_k = int(os.getenv("RETRIEVAL_TOP_K", "8")) + (4 if complex_q else 0)
-    gen_max_tokens = 1000 if complex_q else 700
-    conv_context_block = build_conversation_context_block(context, question)
-
-    retrieved_tables: list[str] = []
-    index_ready = is_index_ready()
-    if index_ready:
-        retrieval = retrieve_tables(question, top_k=retrieval_top_k)
-        tables_used       = retrieval["tables_used"]
-        retrieved_tables  = list(tables_used)
-        similarity_scores = retrieval["similarity_scores"]
-        schema_text       = retrieval["schema_text"]
-    else:
-        all_tables  = await mcp_host.list_tables()
-        entity_tables = [
-            table for table in extract_entities(question)["tables"]
-            if table in all_tables
-        ]
-        tables_used = force_anchor_tables(question, entity_tables)
-        tables_used = [table for table in tables_used if table in all_tables]
-        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
-        if not tables_used:
-            tables_used = all_tables[:min(3, len(all_tables))]
-        schema_text = await mcp_host.get_schema(tables_used)
-        similarity_scores = {}
-
-    tables_used = force_anchor_tables(question, tables_used)
-    if complex_q:
-        tables_used = expand_related_tables(tables_used, max_tables=retrieval_top_k)
-
-    if index_ready:
-        added_tables = [table for table in tables_used if table not in retrieved_tables]
-        if added_tables:
-            extra_schema = get_schema_for_tables(added_tables)
-            if extra_schema:
-                schema_text = schema_text + "\n" + extra_schema
-
-    if context and is_followup_question(question) and context.tables_used:
-        new_tables = [t for t in context.tables_used if t not in tables_used]
-        if new_tables and index_ready:
-            extra_schema = get_schema_for_tables(new_tables)
-            if extra_schema:
-                schema_text = schema_text + "\n" + extra_schema
-                tables_used = tables_used + new_tables
-    preview = ", ".join(tables_used[:8]) + ("…" if len(tables_used) > 8 else "")
-    yield {"type": "status", "stage": "tables",
-           "message": f"📋 Selected {len(tables_used)} relevant tables: {preview}"}
-
-    join_hints = get_join_hints(tables_used)
-
-    yield {"type": "status", "stage": "context",
-           "message": "🔗 Computing join paths and sampling real column values..."}
-
-    past_examples = get_similar_examples(question, top_k=3)
-    value_hints = await build_value_hints(tables_used, mcp_host.run_query)
-    qctx = build_query_context(question, schema_text, join_hints)
-
-    failed_attempts: list[tuple[str, str]] = []
-    model_used = "qwen"
-    last_sql   = ""
-    validation_errors: list[str] = []
-
-    async def generate_for_request(prompt: str, max_tokens: int = 400) -> tuple[str, str]:
-        return await _generate_llm(prompt, org_id, max_tokens)
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        retry_ctx = build_retry_context(failed_attempts)
-
-        # all_orgs=True means an admin-key-verified cross-tenant request (see
-        # _check_admin_key() in the route handler — this function never checks
-        # the key itself, it trusts the caller already did). Otherwise, fall
-        # back to normal single-org filtering, or no filtering if org_id
-        # wasn't supplied at all.
-        if all_orgs:
-            org_hint = ("\nAUTHORIZED CROSS-ORGANIZATION QUERY: This request has been verified as an "
-                        "administrative query. Do NOT filter by zecure_org_id — return data across all "
-                        "organizations, unless the question itself asks to group or filter by organization.\n")
-        elif org_id:
-            org_hint = f"\nSECURITY RULE: ALWAYS filter by zecure_org_id = {org_id} on all tables that have this column.\n"
-        else:
-            org_hint = ""
-
-        system_prompt = get_system_prompt()
-        prompt = f"""{system_prompt}
-{ADVANCED_SQL_HINTS if complex_q else ""}
-{org_hint}
-{conv_context_block}
-
-{past_examples}
-
-Relevant Schema ({len(tables_used)} tables selected):
-{schema_text}
-
-{join_hints}
-
-{qctx['filter_hints']}
-{value_hints}
-
-Intent detected: {qctx['intent']} — {qctx['intent_hint']}
-
-{qctx['skeleton']}
-
-{retry_ctx}
-
-Question: {question}
-"""
-
-        # If the last two attempts failed with the SAME CLASS of error,
-        # escalate straight to the bigger fallback model instead of another
-        # local attempt that's likely to repeat the same mistake.
-
-        yield {"type": "status", "stage": "generating",
-               "message": f"🧠 Generating SQL — attempt {attempt}/{MAX_ATTEMPTS}..."}
-
-        # Trim prompt to fit within Groq free tier token budget
-        prompt, schema_text, tables_used = _trim_prompt_to_budget(
-            prompt, schema_text, tables_used, gen_max_tokens)
-
-        try:
-            raw, model_used = await generate_for_request(prompt, max_tokens=gen_max_tokens)
-            yield {"type": "thinking_token", "text": raw, "model": model_used}
-        except AllProvidersFailed as e:
-            yield {"type": "error", "message": format_all_models_failed_error(e)}
-            return
-
-        raw_no_think = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        sql = extract_sql(raw_no_think)
-        last_sql = sql
-
-        if not re.match(r"^\s*(SELECT|WITH)\b", sql, re.IGNORECASE):
-            err = f"Non-SELECT SQL returned: {sql[:100]}"
-            failed_attempts.append((sql, err))
-            yield {"type": "status", "stage": "retry",
-                   "message": f"⚠️ Attempt {attempt} didn't produce valid SQL — retrying..."}
-            continue
-
-        validation_errors = validate_sql(sql, _known_tables, _known_columns)
-        if not all_orgs and org_id:
-            security_errors = validate_org_security(sql, org_id, _known_columns)
-            validation_errors.extend(security_errors)
-            
-        if validation_errors:
-            failed_attempts.append((sql, "Validation errors:\n" + "\n".join(f"  - {e}" for e in validation_errors)))
-            yield {"type": "status", "stage": "retry",
-                   "message": f"⚠️ Attempt {attempt} had a validation error ({validation_errors[0][:80]}) — retrying..."}
-            continue
-
-        warnings = check_sql_quality(sql)
-
-        yield {"type": "status", "stage": "executing", "message": "▶️ Running the query..."}
-        try:
-            rows = await mcp_host.run_query(sql)
-        except Exception as e:
-            error_str = str(e)
-            repaired_sql = try_auto_repair(sql, error_str)
-            repaired_ok = False
-            if repaired_sql:
-                repair_errors = validate_sql(repaired_sql, _known_tables, _known_columns)
-                if not all_orgs and org_id:
-                    repair_errors.extend(validate_org_security(repaired_sql, org_id, _known_columns))
-                if not repair_errors:
-                    try:
-                        rows = await mcp_host.run_query(repaired_sql)
-                        sql = repaired_sql
-                        repaired_ok = True
-                        yield {"type": "status", "stage": "auto_repair",
-                               "message": "🔧 Auto-fixed a mechanical SQL error (no model call needed)..."}
-                    except Exception:
-                        pass
-            if not repaired_ok:
-                failed_attempts.append((sql, f"Execution error: {error_str}"))
-                yield {"type": "status", "stage": "retry",
-                       "message": f"⚠️ Attempt {attempt} failed to execute — retrying..."}
-                continue
-
-        if len(rows) == 0 and attempt < MAX_ATTEMPTS:
-            yield {"type": "status", "stage": "diagnosis",
-                   "message": "🔎 Zero rows returned — diagnosing and trying a fix..."}
-            fixed_sql = await diagnose_zero_rows(sql, generate_for_request)
-            if fixed_sql and fixed_sql != sql:
-                try:
-                    fixed_rows = await mcp_host.run_query(fixed_sql)
-                    if len(fixed_rows) > 0:
-                        sql, rows = fixed_sql, fixed_rows
-                except Exception:
-                    pass
-
-        yield {"type": "status", "stage": "answer", "message": "✍️ Writing the answer..."}
-        quick_stats = compute_quick_stats(rows)
-        answer = await generate_answer(question, rows, generate_for_request, quick_stats=quick_stats)
-        followups = generate_followups(question, rows, sql, qctx["intent"])
-        store_successful_example(question, sql, len(rows))
-
-        latency_ms = round((time.perf_counter() - start_total) * 1000, 1)
-
-        yield {"type": "final", "data": {
-            "sql":          sql,
-            "rows":         rows,
-            "answer":       answer,
-            "model_used":   model_used,
-            "attempts":     attempt,
-            "tables_used":  tables_used,
-            "sql_warnings": warnings,
-            "intent":       qctx["intent"],
-            "latency_ms":   latency_ms,
-            "insights":     quick_stats,
-            "followups":    followups,
-        }}
-        return
-
-    yield {"type": "error",
-           "message": f"Could not generate working SQL after {MAX_ATTEMPTS} attempts. "
-                      f"Last error: {failed_attempts[-1][1] if failed_attempts else 'unknown'}"}
-
-
-# ── Pydantic models ───────────────────────────────────────────────────────────
-class LLMKeyRequest(BaseModel):
-    provider: str
-    api_key: str
-    model: str
-    customer_id: str = "default"
-
-class LLMKeyToggle(BaseModel):
-    provider: str
-    enabled: bool
-    customer_id: str = "default"
-
-
-
-class ChatRequest(BaseModel):
-    question: str
-    context: Optional[ConversationContext] = None
-    org_id: Optional[str] = None
-    image_base64: Optional[str] = None
-    # Requires a valid X-Admin-Key header on the request to actually take
-    # effect (checked in the route handler, not here) — this is NOT a
-    # per-user permission, it's a shared admin secret. See main.py's
-    # _check_admin_key() and the security note in DEPLOYMENT.md.
-    all_orgs: bool = False
-
-class ChatResponse(BaseModel):
-    sql: str
-    rows: list[dict]
-    answer: str
-    model_used: str
-    cached: bool = False
-    attempts: int
-    latency_ms: float
-    tables_used: list[str]
-    intent: Optional[str] = None
-    sql_warnings: list[str] = []
-    insights: list[str] = []
-    followups: list[str] = []
-
-
-
-
-def _settings_tenant(customer_id: str | None, user: AuthenticatedUser | None) -> str:
-    requested_tenant = (customer_id or "").strip() or "default"
-    if REQUIRE_AUTH:
-        if not user or not user.org_id:
-            raise HTTPException(403, "Authenticated users must have an organization ID")
-        if requested_tenant != "default" and requested_tenant != user.org_id:
-            raise HTTPException(403, "API keys can only be managed for your organization")
-        return user.org_id
-    if requested_tenant == "default":
-        raise HTTPException(400, "Select an organization before managing BYO API keys")
-    return requested_tenant
-
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-# ── LLM Key Management Routes ─────────────────────────────────────────────────
-
-@app.get("/settings/providers")
-def list_providers(user: AuthenticatedUser = Depends(get_current_user)):
-    """List all supported LLM providers and their available models."""
-    return {"providers": provider_catalog()}
-
-@app.get("/settings/keys")
-def list_keys(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
-    """List all configured API keys for a customer (keys are masked)."""
-    tenant_id = _settings_tenant(customer_id, user)
-    return {"keys": get_all_keys(tenant_id)}
-
-@app.post("/settings/keys")
-async def add_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    """Validate and save an API key for a provider."""
-    req.provider = req.provider.strip().lower()
-    req.api_key = req.api_key.strip()
-    req.model = req.model.strip()
-    tenant_id = _settings_tenant(req.customer_id, user)
-    if req.provider not in PROVIDERS:
-        raise HTTPException(400, f"Unknown provider: {req.provider}")
-    if req.provider != "ollama" and not req.api_key:
-        raise HTTPException(400, "API key is required")
-    validation = await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
-    if not validation["valid"]:
-        raise HTTPException(400, f"Key validation failed: {validation.get('error', 'Unknown error')}")
-    result = save_key(req.provider, req.api_key, req.model, tenant_id)
-    if not result.get("success"):
-        raise HTTPException(400, result.get("error", "Failed to save key"))
-    llm_orchestrator.reset_breaker(tenant_id, req.provider)
-    return result
-
-@app.delete("/settings/keys/{provider}")
-def remove_key(provider: str, customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
-    """Remove a saved API key."""
-    tenant_id = _settings_tenant(customer_id, user)
-    llm_orchestrator.reset_breaker(tenant_id, provider)
-    return delete_key(provider, tenant_id)
-
-@app.patch("/settings/keys/toggle")
-def toggle_provider(req: LLMKeyToggle, user: AuthenticatedUser = Depends(get_current_user)):
-    """Enable or disable a provider without deleting the key."""
-    tenant_id = _settings_tenant(req.customer_id, user)
-    llm_orchestrator.reset_breaker(tenant_id, req.provider)
-    return toggle_key(req.provider, req.enabled, tenant_id)
-
-@app.post("/settings/keys/validate")
-async def check_key(req: LLMKeyRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    """Test an API key without saving it."""
-    validation = await llm_orchestrator.validate_key(req.provider, req.api_key, req.model)
-    if validation.get("valid"):
-        tenant_id = _settings_tenant(req.customer_id, user)
-        llm_orchestrator.reset_breaker(tenant_id, req.provider)
-    return validation
-
-
-@app.get("/settings/llm-status")
-def llm_status(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
-    """Report system env keys and BYO key configuration."""
-    tenant_id = _settings_tenant(customer_id, user)
-    byo = get_all_keys(tenant_id)
-    return {
-        "system": system_llm_status(),
-        "tenant_id": tenant_id,
-        "byo_keys": byo,
-        "byo_keys_configured": bool(byo),
-        "key_store": key_store_status(),
-    }
-
-
-def _build_tiered_circuit_status() -> dict:
-    """Map the system fallback chain to { primary, fallback1, fallback2 } for API consumers."""
-    from backend.llm_config import runtime_config
-    from backend.llm_registry import get_provider as _get_provider
-
-    snapshot = runtime_config.snapshot()
-    chain = snapshot.chain()  # e.g. ["groq", "gemini", "ollama"]
-    breaker_data = llm_orchestrator.status(None).get("breakers", {})
-
-    tier_names = ["primary", "fallback1", "fallback2"]
-    result = {}
-
-    for i, provider in enumerate(chain):
-        if i >= len(tier_names):
-            break
-        definition = _get_provider(provider)
-        display = snapshot.ollama_model if provider == "ollama" else definition.display_name
-
-        # A provider's circuit is open if any matching breaker entry is blocked or cooling down
-        circuit_open = False
-        for _key, state in breaker_data.items():
-            if state.get("provider") == provider:
-                if state.get("blocked") or state.get("seconds_until_recovery", 0) > 0:
-                    circuit_open = True
-                    break
-
-        result[tier_names[i]] = {
-            "name": display,
-            "provider": provider,
-            "circuit_open": circuit_open,
-        }
-
-    return result
-
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "circuit_breaker": _build_tiered_circuit_status(),
         "embedding_index_ready": is_index_ready(),
         "llm": system_llm_status(),
     }
 
 
-@app.get("/schema")
-def schema(user: AuthenticatedUser = Depends(get_current_user)):
-    refresh_validator_cache()
-    tables = sorted(list(_known_tables))
-    lines  = [f"Table {t} ({', '.join(_known_columns.get(t, []))})" for t in tables]
-    return {"schema": "\n".join(lines), "tables": tables, "table_count": len(tables)}
-
-
-@app.get("/circuit-status")
-def circuit_status(customer_id: str = "default", user: AuthenticatedUser = Depends(get_current_user)):
-    return llm_orchestrator.status(_settings_tenant(customer_id, user))
-
-
-@app.get("/dashboard/stats")
-def dashboard_stats(user: AuthenticatedUser = Depends(get_current_user)):
-    """Returns real row counts from the database for the dashboard stats API."""
-    refresh_validator_cache()
-    conn = _pool.getconn()
-    stats = {
-        "organizations": 0,
-        "devices": 0,
-        "alerts": 0,
-        "tables": len(_known_tables),
-        "reports": 0,
-    }
-    try:
-        with conn.cursor() as cur:
-            try:
-                cur.execute("SELECT COUNT(*) FROM customer")
-                stats["organizations"] = cur.fetchone()[0]
-            except Exception:
-                conn.rollback()
-
-            try:
-                cur.execute("SELECT COUNT(*) FROM managed_device")
-                stats["devices"] = cur.fetchone()[0]
-            except Exception:
-                conn.rollback()
-
-            try:
-                cur.execute("SELECT COUNT(*) FROM application_control_violations")
-                stats["alerts"] = cur.fetchone()[0]
-            except Exception:
-                conn.rollback()
-
-            try:
-                cur.execute("SELECT COUNT(*) FROM report")
-                stats["reports"] = cur.fetchone()[0]
-            except Exception:
-                conn.rollback()
-        return stats
-    except Exception as e:
-        return {"error": str(e), "organizations": 10, "devices": 89, "alerts": 4, "tables": len(_known_tables), "reports": 53}
-    finally:
-        _pool.putconn(conn)
-
-
-def check_conversational_reply(question: str) -> Optional[str]:
-    """
-    Checks if the question is a standard greeting, thank you, or general chitchat.
-    If so, returns a warm, professional response.
-    Otherwise, returns None (meaning proceed to SQL execution).
-    """
-    q = question.strip().lower().rstrip("?.!")
-    
-    # Check if there are database keywords.
-    db_keywords = {
-        "device", "computer", "laptop", "desktop", "machine", "endpoint", "server", "pc",
-        "user", "employee", "person", "staff", "username", "customer", "client", "company",
-        "tenant", "org", "agent", "alert", "criteria", "policy", "cpu", "ram", "memory", 
-        "disk", "storage", "os", "windows", "macos", "linux", "ip", "mac", "warranty", 
-        "location", "uptime", "scan", "patch", "antivirus", "bitlocker", "firewall", "licens", 
-        "software", "install", "app", "version", "patch", "table", "database", "schema",
-        "query", "sql", "select", "count", "list", "show", "find", "report", "chart", "graph",
-        "compliance", "metric", "active", "inactive"
-    }
-    
-    # If any DB keyword is in the question, bypass conversational replies to prevent blocking real queries
-    words = set(re.findall(r"\b[a-z]{3,}\b", q))
-    if words & db_keywords:
-        return None
-
-    # Common chitchat categories
-    greetings = {
-        "hi", "hello", "hey", "good morning", "good afternoon", "good evening", "greetings", "whats up", "what's up"
-    }
-    how_are_you = {
-        "how are you", "how's it going", "how is it going", "how are you doing", "how do you do"
-    }
-    thanks = {
-        "thanks", "thank you", "gracias", "many thanks", "thank you very much"
-    }
-    identity = {
-        "who are you", "what is your name", "what are you", "tell me about yourself"
-    }
-    capabilities = {
-        "what can you do", "what do you do", "help", "how to use this", "what tables do you have"
-    }
-
-    if q in greetings or any(g in q for g in ("hello", "hey there", "hi there")):
-        return "Hello! I am ready to help you analyze your database. What would you like to query today?"
-        
-    if q in how_are_you or any(h in q for h in how_are_you):
-        return "I'm doing well, thank you! Ready to run some queries and build some charts. What database insights are you looking for?"
-        
-    if q in thanks or any(t in q for t in thanks):
-        return "You're very welcome! Let me know if there's anything else I can help you with."
-        
-    if q in identity or any(i in q for i in identity):
-        return "I am your AI Database Assistant. I can write SQL, execute queries against your database, build interactive charts, and export PDF reports."
-        
-    if q in capabilities or any(c in q for c in capabilities):
-        return (
-            "I can help you query and analyze your enterprise database! For example, you can ask me to:\n"
-            "• Show compliance summaries (patches, antivirus, BitLocker status)\n"
-            "• Count or list devices by operating system, model, or status\n"
-            "• Find inactive agents, expired SSL certificates, or missing critical patches\n"
-            "• Analyze software installation distributions\n\n"
-            "Just type your question in natural language and I will write the SQL and build the chart for you!"
-        )
-
-    # If it is very short (e.g. 1-2 words) and has no database terms, return a friendly generic reply
-    if len(words) <= 2 and not (words & db_keywords):
-        return "I'm here! Let me know what data or insights you need from your database."
-
-    return None
-
-
 @app.post("/chat", response_model=ChatResponse)
 @limiter.limit("10/minute")
-async def chat(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
-    start = time.perf_counter()
-    
-    # Conversational interception
-    conversational_reply = check_conversational_reply(req.question)
-    if conversational_reply is not None:
-        latency_ms = round((time.perf_counter() - start) * 1000, 1)
-        return ChatResponse(
-            sql="",
-            rows=[],
-            answer=conversational_reply,
-            chart_json=None,
-            chart_kind=None,
-            single_stat=None,
-            confidence={"table_relevance": 100, "column_accuracy": 100, "attempt_score": 100, "row_sanity": 100},
-            model_used="Rule-based Classifier",
-            cached=False,
-            attempts=1,
-            latency_ms=latency_ms,
-            tables_used=[],
-            intent="CONVERSATIONAL",
-            sql_warnings=[],
-            insights=[],
-            followups=["Try asking: show all devices", "Try asking: missing patch count"]
-        )
-
+async def chat(request: Request, req: ChatRequest, user: AuthenticatedUser = Depends(get_current_user)):
     # Secure org_id enforcement
     org_id = req.org_id
-    all_orgs = req.all_orgs
     
-    # In auth mode, override client parameters with verified JWT claims
+    # In auth mode, enforce verified JWT claims
     if REQUIRE_AUTH and user:
-        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
-        if not is_admin:
-            org_id = user.org_id
-            all_orgs = False
-            
-    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field (local bypass or admin user)
-    is_admin_bypass = ADMIN_API_KEY and org_id == ADMIN_API_KEY
-    if is_admin_bypass:
-        all_orgs = True
-        org_id = None
+        org_id = user.org_id
 
-    if all_orgs:
-        # If it's a standard all_orgs request without the bypass, verify the header
-        if not is_admin_bypass:
-            _check_admin_key(x_admin_key)
-            
     try:
-        result = await generate_sql_with_retry(req.question, context=req.context, org_id=org_id, all_orgs=all_orgs)
+        result = await generate_sql_with_retry(
+            req.question,
+            context=req.context,
+            org_id=org_id,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    rows = result["rows"]
-    latency_ms = round((time.perf_counter() - start) * 1000, 1)
     return ChatResponse(
         sql=result["sql"],
-        rows=rows,
-        answer=result["answer"],
         model_used=result["model_used"],
-        cached=False,
         attempts=result["attempts"],
-        latency_ms=latency_ms,
-        tables_used=result["tables_used"],
-        intent=result.get("intent"),
-        sql_warnings=result.get("sql_warnings", []),
-        insights=result.get("insights", []),
-        followups=result.get("followups", []),
     )
-
-@app.post("/chat/json")
-@limiter.limit("10/minute")
-async def chat_json(request: Request, req: ChatRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    """
-    Server 1 → Server 2 relay. Sends the question to the internal processing
-    server (port 8001) and returns its JSON response as-is — no streaming.
-    """
-    org_id = req.org_id
-    all_orgs = req.all_orgs
-    if REQUIRE_AUTH and user:
-        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
-        if not is_admin:
-            org_id = user.org_id
-            all_orgs = False
-
-    payload = {
-        "question": req.question,
-        "context": req.context.dict() if req.context else None,
-        "org_id": org_id,
-        "all_orgs": all_orgs,
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post("http://127.0.0.1:8001/process", json=payload)
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code, resp.text)
-    return resp.json()
-
-@app.post("/chat/stream")
-@limiter.limit("10/minute")
-async def chat_stream(request: Request, req: ChatRequest, x_admin_key: Optional[str] = Header(None), user: AuthenticatedUser = Depends(get_current_user)):
-    """
-    Server-Sent Events version of /chat. Streams progress updates and the
-    model's live reasoning/SQL tokens as they're generated, then a final
-    event with the same payload shape as ChatResponse.
-    """
-    conversational_reply = check_conversational_reply(req.question)
-    if conversational_reply is not None:
-        async def conv_event_gen():
-            yield f"data: {json.dumps({'type': 'status', 'stage': 'thinking', 'message': '🧠 Conversational intent detected...'}, default=str)}\n\n"
-            await asyncio.sleep(0.1)
-            # Stream response in small chunks to simulate thinking
-            words = conversational_reply.split(" ")
-            for i in range(len(words)):
-                chunk = words[i] + (" " if i < len(words)-1 else "")
-                yield f"data: {json.dumps({'type': 'answer', 'delta': chunk}, default=str)}\n\n"
-                await asyncio.sleep(0.02)
-                
-            final_data = {
-                "sql": "",
-                "rows": [],
-                "answer": conversational_reply,
-                "chart_json": None,
-                "chart_kind": None,
-                "single_stat": None,
-                "confidence": {"table_relevance": 100, "column_accuracy": 100, "attempt_score": 100, "row_sanity": 100},
-                "model_used": "Rule-based Classifier",
-                "cached": False,
-                "attempts": 1,
-                "latency_ms": 0.1,
-                "tables_used": [],
-                "intent": "CONVERSATIONAL",
-                "sql_warnings": [],
-                "insights": [],
-                "followups": ["Try asking: show all devices", "Try asking: missing patch count"]
-            }
-            yield f"data: {json.dumps({'type': 'final', 'data': final_data}, default=str)}\n\n"
-
-        return StreamingResponse(
-            conv_event_gen(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-        )
-
-    # Secure org_id enforcement
-    org_id = req.org_id
-    all_orgs = req.all_orgs
-    
-    # In auth mode, override client parameters with verified JWT claims
-    if REQUIRE_AUTH and user:
-        is_admin = ADMIN_API_KEY and user.org_id == ADMIN_API_KEY
-        if not is_admin:
-            org_id = user.org_id
-            all_orgs = False
-
-    # Auto-elevate to all_orgs if they typed the ADMIN_API_KEY in the Org ID field (local bypass or admin user)
-    is_admin_bypass = ADMIN_API_KEY and org_id == ADMIN_API_KEY
-    if is_admin_bypass:
-        all_orgs = True
-        org_id = None
-
-    if all_orgs:
-        # If it's a standard all_orgs request without the bypass, verify the header
-        if not is_admin_bypass:
-            _check_admin_key(x_admin_key)
-
-    async def event_gen():
-        try:
-            async for event in generate_sql_streaming(req.question, context=req.context, org_id=org_id, all_orgs=all_orgs, image_base64=req.image_base64):
-                yield f"data: {json.dumps(event, default=str)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
-
-
-
-
-
-
-# ── Editable / re-runnable SQL ────────────────────────────────────────────────
-class RunSqlRequest(BaseModel):
-    sql: str
-    question: str = ""  # used for insights context, optional
-
-@app.post("/run-sql")
-@limiter.limit("15/minute")
-async def run_sql(request: Request, req: RunSqlRequest, user: AuthenticatedUser = Depends(get_current_user)):
-    """
-    Lets the user edit the generated SQL and re-run it directly.
-    Goes through the SAME validate_sql() security guards as the normal
-    pipeline (SELECT/WITH only, no write/DDL keywords, no chained
-    statements).
-    """
-    refresh_validator_cache()
-    sql = req.sql.strip()
-
-    errors = validate_sql(sql, _known_tables, _known_columns)
-    org_id = user.org_id if user else None
-    if REQUIRE_AUTH and org_id:
-        is_admin = ADMIN_API_KEY and org_id == ADMIN_API_KEY
-        if not is_admin:
-            security_errors = validate_org_security(sql, org_id, _known_columns)
-            errors.extend(security_errors)
-            
-    if errors:
-        raise HTTPException(400, "SQL rejected: " + "; ".join(errors))
-
-    try:
-        rows = await mcp_host.run_query(sql)
-    except Exception as e:
-        raise HTTPException(400, f"Execution error: {e}")
-
-    quick_stats = compute_quick_stats(rows)
-
-    return {
-        "sql": sql,
-        "rows": rows,
-        "insights": quick_stats,
-        "row_count": len(rows),
-    }
-
-
-@app.get("/schema/tables")
-def schema_tables(user: AuthenticatedUser = Depends(get_current_user)):
-    """Returns structured table list with columns for the schema explorer."""
-    refresh_validator_cache()
-    fetch_rich_descriptions()
-    conn = _pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT table_name, column_name, data_type
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                ORDER BY table_name, ordinal_position
-            """)
-            db_cols = cur.fetchall()
-            
-        table_cols = {}
-        for r in db_cols:
-            t = r["table_name"]
-            if t not in table_cols:
-                table_cols[t] = []
-            table_cols[t].append(r)
-            
-        tables_info = []
-        for table in sorted(_known_tables):
-            columns = []
-            if table in table_cols:
-                for col in table_cols[table]:
-                    c = col["column_name"]
-                    t_type = col["data_type"]
-                    col_desc = COLUMN_DESCRIPTIONS.get(table, {}).get(c, "")
-                    columns.append({"name": c, "type": t_type, "description": col_desc})
-            desc = TABLE_DESCRIPTIONS.get(table, "")
-            tables_info.append({"name": table, "columns": columns, "description": desc})
-        return {"tables": tables_info, "table_count": len(tables_info)}
-    except Exception as e:
-        return {"tables": [], "error": str(e)}
-    finally:
-        _pool.putconn(conn)
-
-
-# ── Admin: incremental re-indexing ────────────────────────────────────────────
-# For a cloud DB whose schema changes on its own schedule, the embedding
-# index can't rely on someone remembering to run build_index.py by hand.
-# This lets a CI/CD deploy step, a cron job, or a DB-change webhook trigger a
-# re-sync over HTTP instead. Incremental by default — only re-embeds tables
-# whose columns/comments/foreign keys actually changed (see
-# embeddings/schema_introspect.py), so this is cheap enough to call
-# frequently rather than needing careful scheduling.
-
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # unset = admin endpoints disabled
-_reindex_status = {"running": False, "last_result": None, "last_error": None, "last_run_at": None}
-
-
-def _check_admin_key(x_admin_key: Optional[str]):
-    if not ADMIN_API_KEY:
-        raise HTTPException(503, "Admin endpoints are disabled — set ADMIN_API_KEY to enable /admin/reindex.")
-    if x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(401, "Invalid or missing X-Admin-Key header.")
-
-
-def _run_reindex(full: bool):
-    from embeddings.build_index import build_index
-    _reindex_status["running"] = True
-    try:
-        summary = build_index(incremental=not full)
-        _reindex_status["last_result"] = summary
-        _reindex_status["last_error"] = None
-    except Exception as e:
-        _reindex_status["last_error"] = str(e)
-    finally:
-        _reindex_status["running"] = False
-        _reindex_status["last_run_at"] = time.time()
-
-
-@app.post("/admin/reindex")
-async def admin_reindex(
-    background_tasks: BackgroundTasks,
-    full: bool = False,
-    x_admin_key: Optional[str] = Header(None),
-):
-    """
-    Triggers an embedding index sync. Runs in the background (this returns
-    immediately) — poll GET /admin/reindex/status for progress/result.
-    full=true forces a complete rebuild instead of the incremental default;
-    only use this if you suspect the index itself is corrupted, since it
-    re-embeds every table regardless of whether it changed.
-    """
-    _check_admin_key(x_admin_key)
-    if _reindex_status["running"]:
-        raise HTTPException(409, "A re-index is already running — check /admin/reindex/status.")
-    background_tasks.add_task(_run_reindex, full)
-    return {"status": "started", "mode": "full" if full else "incremental"}
-
-
-@app.get("/admin/reindex/status")
-def admin_reindex_status(x_admin_key: Optional[str] = Header(None)):
-    _check_admin_key(x_admin_key)
-    return _reindex_status
