@@ -36,14 +36,14 @@ This repository is a **standalone, high-accuracy Text-to-SQL backend API** runni
 
 ```mermaid
 graph TD
-    Client[Postman / API Client / Frontend] -->|POST /chat & GET /health (Port 8000)| Server[FastAPI Backend Engine]
+    Client["Postman / API Client / Frontend"] -->|"POST /chat & GET /health (Port 8000)"| Server["FastAPI Backend Engine"]
 
-    subgraph "Core Backend Services"
-        Server --> Pipeline[Text-to-SQL Pipeline]
-        Pipeline --> Retriever[Hybrid Retriever BM25 + ChromaDB]
-        Pipeline --> Graph[Schema Graph Engine NetworkX]
-        Pipeline --> Router[LLM Orchestrator & Circuit Breakers]
-        Pipeline --> Validator[AST SQL & Org Security Validator]
+    subgraph CoreBackend["Core Backend Services"]
+        Server --> Pipeline["Text-to-SQL Pipeline"]
+        Pipeline --> Retriever["Hybrid Retriever (BM25 + ChromaDB)"]
+        Pipeline --> Graph["Schema Graph Engine (NetworkX)"]
+        Pipeline --> Router["LLM Orchestrator & Circuit Breakers"]
+        Pipeline --> Validator["AST SQL & Org Security Validator"]
     end
 ```
 

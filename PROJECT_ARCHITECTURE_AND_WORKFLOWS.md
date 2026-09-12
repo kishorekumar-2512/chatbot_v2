@@ -72,15 +72,15 @@ graph TB
     end
 
     %% Client flows
-    Postman -->|POST /chat| SlowAPI
-    Frontend -->|POST /chat| SlowAPI
-    Postman -->|GET /health| Server
-    Cognito -.->|Fetch JWKS Keys| AuthMiddleware
+    Postman -->|"POST /chat"| SlowAPI
+    Frontend -->|"POST /chat"| SlowAPI
+    Postman -->|"GET /health"| Server
+    Cognito -.->|"Fetch JWKS Keys"| AuthMiddleware
     AuthMiddleware <--> JWKSCache
 
     %% Gateway to Engine
     SlowAPI --> AuthMiddleware
-    AuthMiddleware -->|Validated Tenant / Org ID| PipelineManager
+    AuthMiddleware -->|"Validated Tenant / Org ID"| PipelineManager
 
     %% Pipeline Internals
     PipelineManager --> L1
@@ -93,13 +93,13 @@ graph TB
     L4 --> L5
     L5 <--> BreakerStore
     L5 --> GroqAPI
-    L5 -.->|Fallback 1| GeminiAPI
-    L5 -.->|Fallback 2| OllamaAPI
+    L5 -.->|"Fallback 1"| GeminiAPI
+    L5 -.->|"Fallback 2"| OllamaAPI
     L5 --> L6
-    L6 -->|Failure / Unknown Cols| SelfCorrection
-    SelfCorrection -->|Diff Retry Prompt| L5
-    L6 -->|Pass| PipelineManager
-    PipelineManager -.->|Store Successful Example| ChromaStore
+    L6 -->|"Failure / Unknown Cols"| SelfCorrection
+    SelfCorrection -->|"Diff Retry Prompt"| L5
+    L6 -->|"Pass"| PipelineManager
+    PipelineManager -.->|"Store Successful Example"| ChromaStore
 
     %% Offline Indexing
     PostgresDB -.->|Schema Introspection & DDLs| ChromaStore
@@ -319,7 +319,7 @@ flowchart LR
 
         TablesIn --> Expand --> CheckJunction
         CheckJunction -->|Yes| AddConnector
-        CheckJunction -->|No| Ready[Keep Tables]
+        CheckJunction -->|No| Ready["Keep Tables"]
     end
 
     EdgeJoin --> JoinHints["Join Hints String Injected into Prompt:\nSuggested JOIN path starting from 'managed_device':\nJOIN device_missing_patch ON dmp.managed_device_id = md.id\nJOIN org_patch ON op.patch_id = dmp.patch_id"]
